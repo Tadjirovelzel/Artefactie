@@ -4,13 +4,8 @@ data in separate vectors to process. Written for KT3401 - Assignment Artefact De
 
 '''
 
-<<<<<<< HEAD
 list_names = {"Tadjiro", "Lotte", "Mohammed", "Robin", "morit\OneDrive"}
 path_list = {"C:\Users\tvelzel\Documents\GitHub\Artefactie\data\KT3401_AFdata_2025", }
-=======
-list_names = {"Tadjiro", "Lotte", "Mohammed", "Robin"}
-path_list = {"C:\Users\tvelzel\Documents\GitHub\Artefactie\data\KT3401_AFdata_2025", "C:\Users\lotte\Documents\Artefactie\data"}
->>>>>>> 0e0c118cab05aea1b32e3a6e372a5a121f501c57
 
 # #%% Clear system
 # from IPython import get_ipython
