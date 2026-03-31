@@ -24,9 +24,10 @@ fs = 100
 
 #%% Import modules
 import pandas as pd
-import numpy as np 
+import numpy as np
 import os
 import matplotlib.pyplot as plt
+from scipy.signal import spectrogram
 
 def read_Artefacts(path, folder, filename, fs):
     """
@@ -67,9 +68,35 @@ def read_Artefacts(path, folder, filename, fs):
 
     return t, ABP, CVP
 
-t, ABP, CVP = read_Artefacts(path, folder, filename, fs)
-plt.plot(t,ABP)
-plt.show()
+resolution = 1   # seconds per spectrogram window
+frange = [0, 10] # frequency range of interest (Hz)
 
-plt.plot(t,CVP)
+t, ABP, CVP = read_Artefacts(path, folder, filename, fs)
+
+# Spectrogram
+frequencies, times, Sxx = spectrogram(ABP, fs, nperseg=int(resolution * fs), noverlap=0, nfft=int(fs * resolution))
+Sxx_db = 10 * np.log10(Sxx)  # omzetten naar decibel
+Amplitude = np.mean(np.abs(Sxx[(frequencies >= frange[0]) & (frequencies <= frange[1]), :]), axis=0)
+
+fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(10, 9))
+fig.suptitle(f"{folder} - {filename}")
+
+ax1.plot(t, ABP)
+ax1.set_title("Arterial Blood Pressure (ABP)")
+ax1.set_xlabel("Time (s)")
+ax1.set_ylabel("ABP (mmHg)")
+
+ax2.plot(t, CVP)
+ax2.set_title("Central Venous Pressure (CVP)")
+ax2.set_xlabel("Time (s)")
+ax2.set_ylabel("CVP (mmHg)")
+
+im = ax3.pcolormesh(times, frequencies, Sxx_db, shading="auto", cmap="viridis")
+ax3.set_ylim(frange)
+ax3.set_title("ABP Spectrogram")
+ax3.set_xlabel("Time (s)")
+ax3.set_ylabel("Frequency (Hz)")
+fig.colorbar(im, ax=ax3, label="Power (dB)")
+
+plt.tight_layout()
 plt.show()
