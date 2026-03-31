@@ -3,6 +3,10 @@ Model with function to load artefact data from Excel .xls and .xlsx files and sp
 data in separate vectors to process. Written for KT3401 - Assignment Artefact Detection
 
 '''
+
+list_names = {"Tadjiro", "Lotte", "Mohammed", "Robin"}
+path_list = {"C:\Users\tvelzel\Documents\GitHub\Artefactie\data\KT3401_AFdata_2025", }
+
 # #%% Clear system
 # from IPython import get_ipython
 # # Clear all variables (IPython/Jupyter)
