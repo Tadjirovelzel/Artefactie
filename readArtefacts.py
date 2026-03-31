@@ -78,18 +78,15 @@ frequencies, times, Sxx = spectrogram(ABP, fs, nperseg=int(resolution * fs), nov
 Sxx_db = 10 * np.log10(Sxx)  # omzetten naar decibel
 Amplitude = np.mean(np.abs(Sxx[(frequencies >= frange[0]) & (frequencies <= frange[1]), :]), axis=0)
 
-fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(10, 9))
+fig, (ax1, ax3) = plt.subplots(2, 1, figsize=(10, 6))
 fig.suptitle(f"{folder} - {filename}")
 
-ax1.plot(t, ABP)
-ax1.set_title("Arterial Blood Pressure (ABP)")
+ax1.plot(t, ABP, label="ABP")
+ax1.plot(t, CVP, label="CVP")
+ax1.set_title("Arterial Blood Pressure (ABP) & Central Venous Pressure (CVP)")
 ax1.set_xlabel("Time (s)")
-ax1.set_ylabel("ABP (mmHg)")
-
-ax2.plot(t, CVP)
-ax2.set_title("Central Venous Pressure (CVP)")
-ax2.set_xlabel("Time (s)")
-ax2.set_ylabel("CVP (mmHg)")
+ax1.set_ylabel("Pressure (mmHg)")
+ax1.legend()
 
 im = ax3.pcolormesh(times, frequencies, Sxx_db, shading="auto", cmap="viridis")
 ax3.set_ylim(frange)
