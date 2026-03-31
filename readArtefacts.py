@@ -4,7 +4,7 @@ data in separate vectors to process. Written for KT3401 - Assignment Artefact De
 
 '''
 
-list_names = {"Tadjiro", "Lotte", "Mohammed", "Robin"}
+list_names = {"Tadjiro", "Lotte", "Mohammed", "Robin", "morit\OneDrive"}
 path_list = {"C:\Users\tvelzel\Documents\GitHub\Artefactie\data\KT3401_AFdata_2025", }
 
 # #%% Clear system
