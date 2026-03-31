@@ -4,8 +4,12 @@ data in separate vectors to process. Written for KT3401 - Assignment Artefact De
 
 '''
 
-list_names = {"Tadjiro", "Lotte", "Mohammed", "Robin", "morit\OneDrive"}
-path_list = {"C:\Users\tvelzel\Documents\GitHub\Artefactie\data\KT3401_AFdata_2025",  "C:\Users\lotte\Documents\Artefactie\data"}
+import os
+
+path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "KT3401_AFdata_2025")
+folder = "Calibratie"
+filename = "D01Cal.xlsx"
+fs = 100
 
 # #%% Clear system
 # from IPython import get_ipython
@@ -22,8 +26,7 @@ path_list = {"C:\Users\tvelzel\Documents\GitHub\Artefactie\data\KT3401_AFdata_20
 import pandas as pd
 import numpy as np 
 import os
-
-# git is kut
+import matplotlib.pyplot as plt
 
 def read_Artefacts(path, folder, filename, fs):
     """
@@ -64,13 +67,9 @@ def read_Artefacts(path, folder, filename, fs):
 
     return t, ABP, CVP
 
+t, ABP, CVP = read_Artefacts(path, folder, filename, fs)
+plt.plot(t,ABP)
+plt.show()
 
-if __name__ == "__main__":
-
-# Load data
-    path = []
-    folder = []
-    filename = []
-    fs = 100
-
-    t, ABP, CVP = read_Artefacts(path, folder, filename, fs)
+plt.plot(t,CVP)
+plt.show()
