@@ -3,14 +3,6 @@ Model with function to load artefact data from Excel .xls and .xlsx files and sp
 data in separate vectors to process. Written for KT3401 - Assignment Artefact Detection
 
 '''
-
-import os
-
-path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "KT3401_AFdata_2025")
-folder = "Calibratie"
-filename = "D01Cal.xlsx"
-fs = 100
-
 # #%% Clear system
 # from IPython import get_ipython
 # # Clear all variables (IPython/Jupyter)
@@ -20,14 +12,26 @@ fs = 100
 # plt.close('all')
 # import os
 # # Clear the console
-# os.system('cls' if os.name == 'nt' else 'clear')
+# os.system('cls' if os.name == 'nt' else 'clear')e
 
 #%% Import modules
+from pathlib import Path
 import pandas as pd
 import numpy as np
 import os
 import matplotlib.pyplot as plt
 from scipy.signal import spectrogram
+
+def get_project_root() -> Path:
+    if "__file__" in globals():
+        return Path(__file__).resolve().parent
+    return Path.cwd()
+
+project_root = get_project_root()
+path = project_root / "data" / "KT3401_AFdata_2025"
+folder = "Calibratie"
+filename = "D01Cal.xlsx"
+fs = 100
 
 def read_Artefacts(path, folder, filename, fs):
     """
