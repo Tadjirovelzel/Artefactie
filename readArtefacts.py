@@ -23,7 +23,7 @@ import numpy as np
 import os
 import matplotlib.pyplot as plt
 from scipy.signal import spectrogram
-from detectie import compute_fft, detect_peaks_abp, detect_artifacts
+from detectie import compute_fft, detect_peaks_abp, detect_artifacts, redetect_peaks_clean, detect_gasbubble
 
 def get_project_root() -> Path:
     if "__file__" in globals():
@@ -81,11 +81,22 @@ def run_pipeline(filepath):
     print(f"ABP — Dominant: {abp_dominant_freq:.2f} Hz ({abp_dominant_freq * 60:.0f} bpm), Peaks: {len(abp_peaks)}, Prominence threshold: {abp_prominence:.2f}")
     print(f"CVP — Dominant: {cvp_dominant_freq:.2f} Hz ({cvp_dominant_freq * 60:.0f} bpm), Peaks: {len(cvp_peaks)}, Prominence threshold: {cvp_prominence:.2f}")
 
-    # Artifact detection
+    # Artifact detection (initial peaks used only for thresholds)
     abp_flush, abp_cal, abp_flush_thr, abp_cal_thr = detect_artifacts(ABP, fs, abp_dominant_freq, abp_peaks)
-    cvp_flush, cvp_cal, cvp_flush_thr, cvp_cal_thr = detect_artifacts(CVP, fs, cvp_dominant_freq, cvp_peaks)
+    cvp_flush, _, cvp_flush_thr, _ = detect_artifacts(CVP, fs, cvp_dominant_freq, cvp_peaks)
+    cvp_cal = []  # calibration detection only for ABP
     print(f"ABP — Flush artifacts: {len(abp_flush)}, Calibration artifacts: {len(abp_cal)}")
-    print(f"CVP — Flush artifacts: {len(cvp_flush)}, Calibration artifacts: {len(cvp_cal)}")
+    print(f"CVP — Flush artifacts: {len(cvp_flush)}")
+
+    # Re-run peak detection on clean sections only (excluding flush + cal artifacts)
+    abp_peaks = redetect_peaks_clean(ABP, fs, abp_dominant_freq, abp_flush + abp_cal)
+    cvp_peaks = redetect_peaks_clean(CVP, fs, cvp_dominant_freq, cvp_flush + cvp_cal)
+    print(f"ABP — Peaks after re-detection: {len(abp_peaks)}")
+    print(f"CVP — Peaks after re-detection: {len(cvp_peaks)}")
+
+    # Gasbubble detection using clean peaks
+    abp_gasbubble, abp_avg_sys, abp_avg_dia = detect_gasbubble(ABP, fs, abp_dominant_freq, abp_peaks, artifact_periods=abp_flush + abp_cal)
+    print(f"ABP — Gasbubble artifacts: {len(abp_gasbubble)} (avg sys: {abp_avg_sys:.1f}, avg dia: {abp_avg_dia:.1f})")
 
     # Spectrograms
     abp_freqs, abp_times, abp_Sxx = spectrogram(ABP, fs, nperseg=int(resolution * fs), noverlap=0, nfft=int(fs * resolution))
@@ -96,13 +107,16 @@ def run_pipeline(filepath):
     fig, axes = plt.subplots(3, 2, figsize=(14, 10))
     fig.suptitle(f"{folder} — {filename}")
 
-    def shade_artifacts(ax, t, flush_periods, cal_periods):
+    def shade_artifacts(ax, t, flush_periods, cal_periods, gasbubble_periods):
         for s, e in flush_periods:
             ax.axvspan(t[s], t[min(e, len(t) - 1)], color="red", alpha=0.2,
                        label="Flush type artifact")
         for s, e in cal_periods:
             ax.axvspan(t[s], t[min(e, len(t) - 1)], color="blue", alpha=0.2,
                        label="Calibration artifact")
+        for s, e in gasbubble_periods:
+            ax.axvspan(t[s], t[min(e, len(t) - 1)], color="green", alpha=0.2,
+                       label="Gasbubble artifact")
         # Deduplicate legend entries
         handles, labels = ax.get_legend_handles_labels()
         seen = {}
@@ -114,8 +128,10 @@ def run_pipeline(filepath):
     axes[0, 0].plot(t, ABP)
     axes[0, 0].plot(t[abp_peaks], ABP[abp_peaks], "x", color="red", label=f"Peaks (n={len(abp_peaks)})")
     axes[0, 0].axhline(abp_flush_thr, color="red", linestyle=":", linewidth=0.8, label=f"Flush threshold ({abp_flush_thr:.1f} mmHg)")
-    axes[0, 0].axhline(abp_cal_thr, color="blue", linestyle=":", linewidth=0.8, label=f"Cal. threshold 0.7× avg peak ({abp_cal_thr:.1f} mmHg)")
-    shade_artifacts(axes[0, 0], t, abp_flush, abp_cal)
+    axes[0, 0].axhline(abp_cal_thr, color="blue", linestyle=":", linewidth=0.8, label=f"Cal. threshold 0.25× avg peak ({abp_cal_thr:.1f} mmHg)")
+    axes[0, 0].axhline(abp_avg_sys, color="green", linestyle=":", linewidth=0.8, label=f"Avg systolic ({abp_avg_sys:.1f} mmHg)")
+    axes[0, 0].axhline(abp_avg_dia, color="darkgreen", linestyle=":", linewidth=0.8, label=f"Avg diastolic ({abp_avg_dia:.1f} mmHg)")
+    shade_artifacts(axes[0, 0], t, abp_flush, abp_cal, abp_gasbubble)
     axes[0, 0].set_title("Arterial Blood Pressure (ABP)")
     axes[0, 0].set_xlabel("Time (s)")
     axes[0, 0].set_ylabel("ABP (mmHg)")
@@ -123,8 +139,8 @@ def run_pipeline(filepath):
     axes[0, 1].plot(t, CVP, color="tab:orange")
     axes[0, 1].plot(t[cvp_peaks], CVP[cvp_peaks], "x", color="red", label=f"Peaks (n={len(cvp_peaks)})")
     axes[0, 1].axhline(cvp_flush_thr, color="red", linestyle=":", linewidth=0.8, label=f"Flush threshold ({cvp_flush_thr:.1f} mmHg)")
-    axes[0, 1].axhline(cvp_cal_thr, color="blue", linestyle=":", linewidth=0.8, label=f"Cal. threshold 0.7× avg peak ({cvp_cal_thr:.1f} mmHg)")
-    shade_artifacts(axes[0, 1], t, cvp_flush, cvp_cal)
+
+    shade_artifacts(axes[0, 1], t, cvp_flush, cvp_cal, [])
     axes[0, 1].set_title("Central Venous Pressure (CVP)")
     axes[0, 1].set_xlabel("Time (s)")
     axes[0, 1].set_ylabel("CVP (mmHg)")
