@@ -6,7 +6,7 @@ flush, calibration, and gas bubble artefacts. Written for KT3401 - Artefact Dete
 """
 
 import numpy as np
-from scipy.signal import find_peaks
+from scipy.signal import find_peaks, butter, filtfilt
 
 
 # ---------------------------------------------------------------------------
@@ -125,7 +125,8 @@ def compute_rms(signal):
     return np.sqrt(np.mean(np.asarray(signal, dtype=float) ** 2))
 
 
-def detect_peaks_abp(signal, fs, rms_factor=0.5, hr_range=(0.5, 3.0)):
+def detect_peaks_abp(signal, fs, rms_factor=0.5, hr_range=(0.5, 3.0),
+                     physiological_max=None):
     """
     Detect systolic peaks in an ABP (or CVP) signal.
 
@@ -135,10 +136,14 @@ def detect_peaks_abp(signal, fs, rms_factor=0.5, hr_range=(0.5, 3.0)):
 
     Parameters
     ----------
-    signal     : 1D array-like  pressure values
-    fs         : float          sampling rate (Hz)
-    rms_factor : float          prominence = rms_factor * RMS (default 0.5)
-    hr_range   : (float, float) heart-rate search band in Hz (default 0.5–3.0)
+    signal            : 1D array-like  pressure values
+    fs                : float          sampling rate (Hz)
+    rms_factor        : float          prominence = rms_factor * RMS (default 0.5)
+    hr_range          : (float, float) heart-rate search band in Hz (default 0.5–3.0)
+    physiological_max : float or None  if given, only samples below this value are
+                        used to compute the RMS prominence threshold (prevents large
+                        artefact spikes from inflating the threshold and masking
+                        normal-amplitude peaks)
 
     Returns
     -------
@@ -149,14 +154,20 @@ def detect_peaks_abp(signal, fs, rms_factor=0.5, hr_range=(0.5, 3.0)):
     signal = np.asarray(signal, dtype=float)
     _, _, dominant_freq = compute_fft(signal, fs, frange=hr_range)
 
-    min_distance         = int(fs / dominant_freq * 0.6)
-    prominence_threshold = compute_rms(signal) * rms_factor
+    min_distance = int(fs / dominant_freq * 0.6)
+
+    if physiological_max is not None:
+        normal_samples = signal[signal <= physiological_max]
+        rms_signal = normal_samples if len(normal_samples) > 1 else signal
+    else:
+        rms_signal = signal
+    prominence_threshold = compute_rms(rms_signal) * rms_factor
 
     peaks, _ = find_peaks(signal, distance=min_distance, prominence=prominence_threshold)
     return peaks, dominant_freq, prominence_threshold
 
 
-def detect_artifacts(signal, fs, dominant_freq, peaks):
+def detect_artifacts(signal, fs, dominant_freq, peaks, physiological_max=None):
     """
     Detect flush-type and calibration artefacts based on signal level and duration.
 
@@ -169,10 +180,13 @@ def detect_artifacts(signal, fs, dominant_freq, peaks):
 
     Parameters
     ----------
-    signal        : 1D array-like
-    fs            : float  sampling rate (Hz)
-    dominant_freq : float  dominant cardiac frequency (Hz)
-    peaks         : array  indices of detected systolic peaks
+    signal           : 1D array-like
+    fs               : float  sampling rate (Hz)
+    dominant_freq    : float  dominant cardiac frequency (Hz)
+    peaks            : array  indices of detected systolic peaks
+    physiological_max: float or None  if given, only peaks below this value are
+                       used to compute the flush threshold (prevents long elevated
+                       artefact periods from inflating the baseline estimate)
 
     Returns
     -------
@@ -184,7 +198,11 @@ def detect_artifacts(signal, fs, dominant_freq, peaks):
     signal      = np.asarray(signal, dtype=float)
     min_samples = int(2 * fs / dominant_freq)
 
-    flush_threshold = np.mean(signal[peaks])
+    peak_heights = signal[peaks]
+    if physiological_max is not None:
+        normal_peaks = peak_heights[peak_heights <= physiological_max]
+        peak_heights = normal_peaks if len(normal_peaks) > 0 else peak_heights
+    flush_threshold = np.mean(peak_heights)
     cal_threshold   = flush_threshold * 0.25
 
     flush_periods = _find_periods(signal > flush_threshold, min_samples)
@@ -193,7 +211,8 @@ def detect_artifacts(signal, fs, dominant_freq, peaks):
     return flush_periods, cal_periods, flush_threshold, cal_threshold
 
 
-def redetect_peaks_clean(signal, fs, dominant_freq, artifact_periods):
+def redetect_peaks_clean(signal, fs, dominant_freq, artifact_periods,
+                         physiological_max=None):
     """
     Re-run systolic peak detection on the signal sections that fall outside
     all artifact periods.
@@ -201,12 +220,19 @@ def redetect_peaks_clean(signal, fs, dominant_freq, artifact_periods):
     Each clean section gets its own prominence threshold (std of that section)
     so that low-amplitude sections (e.g. after a flush) are handled correctly.
 
+    For signals with a known physiological ceiling (e.g. CVP ≤ 25 mmHg), the
+    optional physiological_max parameter restricts the std calculation to
+    samples below that value. This prevents long elevated artefact periods
+    from inflating the prominence threshold and causing missed peaks.
+
     Parameters
     ----------
-    signal           : 1D array-like
-    fs               : float  sampling rate (Hz)
-    dominant_freq    : float  dominant cardiac frequency (Hz)
-    artifact_periods : list of (start_idx, end_idx) tuples to exclude
+    signal             : 1D array-like
+    fs                 : float  sampling rate (Hz)
+    dominant_freq      : float  dominant cardiac frequency (Hz)
+    artifact_periods   : list of (start_idx, end_idx) tuples to exclude
+    physiological_max  : float or None  if given, only samples below this
+                         value are used to compute the prominence threshold
 
     Returns
     -------
@@ -215,17 +241,98 @@ def redetect_peaks_clean(signal, fs, dominant_freq, artifact_periods):
     signal       = np.asarray(signal, dtype=float)
     min_distance = int(fs / dominant_freq * 0.6)
 
-    artifact_mask = _build_artifact_mask(len(signal), artifact_periods)
+    artifact_mask  = _build_artifact_mask(len(signal), artifact_periods)
     clean_sections = _find_periods(~artifact_mask, min_samples=min_distance * 2)
 
     all_peaks = []
     for s, e in clean_sections:
-        section    = signal[s:e]
-        prominence = np.std(section)   # std is insensitive to DC offset
+        section = signal[s:e]
+        if physiological_max is not None:
+            normal_samples = section[section <= physiological_max]
+            prominence = np.std(normal_samples) if len(normal_samples) > 1 else np.std(section)
+        else:
+            prominence = np.std(section)
         local_peaks, _ = find_peaks(section, distance=min_distance, prominence=prominence)
         all_peaks.extend(local_peaks + s)
 
     return np.array(all_peaks, dtype=int)
+
+
+def detect_infuus_cvp(signal, fs, dominant_freq, flush_threshold, hp_cutoff=0.3):
+    """
+    Detect infuus (IV infusion) artefacts on a CVP signal.
+
+    An infuus artefact causes the CVP baseline to rise above the flush threshold
+    while cardiac oscillations continue on top. This contrasts with a true flush,
+    which also elevates the signal but suppresses oscillations.
+
+    Method
+    ------
+    1. Find all periods where the signal exceeds flush_threshold for more than
+       2× the dominant cardiac interval (same criterion as flush detection).
+    2. Apply a high-pass Butterworth filter (default cutoff 0.3 Hz) to each
+       elevated period to remove the slow baseline rise.
+    3. Attempt peak detection on the high-pass filtered section. If at least
+       two cardiac peaks are found, the period is classified as infuus;
+       otherwise it is classified as a flush.
+
+    Parameters
+    ----------
+    signal          : 1D array-like  CVP values
+    fs              : float          sampling rate (Hz)
+    dominant_freq   : float          dominant cardiac frequency (Hz)
+    flush_threshold : float          signal level above which a period is
+                                     considered elevated (same as flush_threshold
+                                     returned by detect_artifacts)
+    hp_cutoff       : float          high-pass filter cutoff frequency (Hz),
+                                     default 0.3 Hz
+
+    Returns
+    -------
+    infuus_periods : list of (start_idx, end_idx) tuples
+    flush_periods  : list of (start_idx, end_idx) tuples
+    signal_hp      : 1D array  high-pass filtered signal (full length)
+    """
+    signal      = np.asarray(signal, dtype=float)
+    min_samples = int(fs / dominant_freq)        # 1 cardiac cycle minimum duration
+    min_distance = int(fs / dominant_freq * 0.6)
+
+    # High-pass filter to isolate cardiac oscillations
+    b, a      = butter(2, hp_cutoff / (fs / 2), btype="high")
+    signal_hp = filtfilt(b, a, signal)
+
+    elevated_periods = _find_periods(signal > flush_threshold, min_samples)
+    window_samples   = int(fs / dominant_freq * 5)  # 3-cycle analysis window
+
+    infuus_periods = []
+    flush_periods  = []
+
+    for s, e in elevated_periods:
+        section_hp = signal_hp[s:e]
+        n = e - s
+
+        # Sliding-window oscillation mask: True where cardiac peaks are present.
+        # Using 50 % overlap so that transitions between infuus and flush are
+        # captured at roughly half-window resolution (~1.5 cardiac cycles).
+        osc_mask = np.zeros(n, dtype=bool)
+        step = max(window_samples // 2, 1)
+        for i in range(0, n, step):
+            win = section_hp[i : min(i + window_samples, n)]
+            if len(win) < min_distance * 2:
+                continue
+            prom = np.std(win) * 0.5
+            if prom == 0:
+                continue
+            peaks_in_win, _ = find_peaks(win, distance=min_distance, prominence=prom)
+            if len(peaks_in_win) >= 1:
+                osc_mask[i : i + len(win)] = True
+
+        for sub_s, sub_e in _find_periods(osc_mask,  min_samples):
+            infuus_periods.append((s + sub_s, s + sub_e))
+        for sub_s, sub_e in _find_periods(~osc_mask, min_samples):
+            flush_periods.append((s + sub_s, s + sub_e))
+
+    return infuus_periods, flush_periods, signal_hp
 
 
 def detect_gasbubble(signal, fs, dominant_freq, peaks, artifact_periods=None):

@@ -26,6 +26,7 @@ from detectie import (
     compute_fft,
     detect_peaks_abp,
     detect_artifacts,
+    detect_infuus_cvp,
     redetect_peaks_clean,
     detect_gasbubble,
 )
@@ -86,12 +87,14 @@ def read_artefacts(filepath, fs):
 # Visualisation helpers
 # ---------------------------------------------------------------------------
 
-def shade_artifacts(ax, t, flush_periods, cal_periods, gasbubble_periods):
+def shade_artifacts(ax, t, flush_periods, cal_periods, gasbubble_periods,
+                    infuus_periods=None):
     """
     Shade artefact periods on a time-series axis.
 
-    Flush artefacts are shaded red, calibration artefacts blue, and gas-bubble
-    artefacts green. Duplicate legend entries are automatically removed.
+    Flush artefacts are shaded red, calibration artefacts blue, gas-bubble
+    artefacts green, and infuus artefacts purple. Duplicate legend entries
+    are automatically removed.
 
     Parameters
     ----------
@@ -100,13 +103,18 @@ def shade_artifacts(ax, t, flush_periods, cal_periods, gasbubble_periods):
     flush_periods     : list of (start_idx, end_idx) tuples
     cal_periods       : list of (start_idx, end_idx) tuples
     gasbubble_periods : list of (start_idx, end_idx) tuples
+    infuus_periods    : list of (start_idx, end_idx) tuples  (optional)
     """
+    infuus_periods = infuus_periods or []
+
     for s, e in flush_periods:
-        ax.axvspan(t[s], t[min(e, len(t) - 1)], color="red",   alpha=0.2, label="Flush type artifact")
+        ax.axvspan(t[s], t[min(e, len(t) - 1)], color="red",    alpha=0.2, label="Flush type artifact")
     for s, e in cal_periods:
-        ax.axvspan(t[s], t[min(e, len(t) - 1)], color="blue",  alpha=0.2, label="Calibration artifact")
+        ax.axvspan(t[s], t[min(e, len(t) - 1)], color="blue",   alpha=0.2, label="Calibration artifact")
     for s, e in gasbubble_periods:
-        ax.axvspan(t[s], t[min(e, len(t) - 1)], color="green", alpha=0.2, label="Gasbubble artifact")
+        ax.axvspan(t[s], t[min(e, len(t) - 1)], color="green",  alpha=0.2, label="Gasbubble artifact")
+    for s, e in infuus_periods:
+        ax.axvspan(t[s], t[min(e, len(t) - 1)], color="purple", alpha=0.2, label="Infuus artifact")
 
     handles, labels = ax.get_legend_handles_labels()
     unique = {}
@@ -157,12 +165,15 @@ def plot_results(t, ABP, CVP, results, folder, filename):
     ax.set_ylabel("ABP (mmHg)")
 
     ax = axes[0, 1]
-    ax.plot(t, CVP, color="tab:orange")
+    ax.plot(t, CVP, color="tab:orange", label="CVP")
+    ax.plot(t, results["cvp_hp"], color="tab:gray", linewidth=0.8,
+            alpha=0.7, label="CVP (high-pass filtered)")
     ax.plot(t[results["cvp_peaks"]], CVP[results["cvp_peaks"]], "x", color="red",
             label=f"Peaks (n={len(results['cvp_peaks'])})")
     ax.axhline(results["cvp_flush_thr"], color="red", linestyle=":", linewidth=0.8,
                label=f"Flush threshold ({results['cvp_flush_thr']:.1f} mmHg)")
-    shade_artifacts(ax, t, results["cvp_flush"], [], [])
+    shade_artifacts(ax, t, results["cvp_flush"], [], [],
+                    infuus_periods=results["cvp_infuus"])
     ax.set_title("Central Venous Pressure (CVP)")
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("CVP (mmHg)")
@@ -251,7 +262,7 @@ def run_pipeline(filepath):
 
     # Step 3 — Initial peak detection
     abp_peaks, abp_dominant_freq, abp_prominence = detect_peaks_abp(ABP, FS)
-    cvp_peaks, cvp_dominant_freq, cvp_prominence = detect_peaks_abp(CVP, FS)
+    cvp_peaks, cvp_dominant_freq, cvp_prominence = detect_peaks_abp(CVP, FS, physiological_max=25)
     print(f"ABP — {abp_dominant_freq:.2f} Hz ({abp_dominant_freq * 60:.0f} bpm), "
           f"{len(abp_peaks)} peaks")
     print(f"CVP — {cvp_dominant_freq:.2f} Hz ({cvp_dominant_freq * 60:.0f} bpm), "
@@ -260,14 +271,20 @@ def run_pipeline(filepath):
     # Step 4 — Artefact detection (calibration for ABP only)
     abp_flush, abp_cal, abp_flush_thr, abp_cal_thr = detect_artifacts(
         ABP, FS, abp_dominant_freq, abp_peaks)
-    cvp_flush, _,       cvp_flush_thr, _            = detect_artifacts(
-        CVP, FS, cvp_dominant_freq, cvp_peaks)
+    _, _, cvp_flush_thr, _ = detect_artifacts(
+        CVP, FS, cvp_dominant_freq, cvp_peaks, physiological_max=25)
+
+    # CVP elevated periods are split into infuus vs flush by oscillation check
+    cvp_infuus, cvp_flush, cvp_hp = detect_infuus_cvp(
+        CVP, FS, cvp_dominant_freq, cvp_flush_thr)
+
     print(f"ABP — {len(abp_flush)} flush, {len(abp_cal)} calibration artefacts")
-    print(f"CVP — {len(cvp_flush)} flush artefacts")
+    print(f"CVP — {len(cvp_flush)} flush, {len(cvp_infuus)} infuus artefacts")
 
     # Step 5 — Re-detect peaks on clean sections
     abp_peaks = redetect_peaks_clean(ABP, FS, abp_dominant_freq, abp_flush + abp_cal)
-    cvp_peaks = redetect_peaks_clean(CVP, FS, cvp_dominant_freq, cvp_flush)
+    cvp_peaks = redetect_peaks_clean(CVP, FS, cvp_dominant_freq, cvp_flush + cvp_infuus,
+                                     physiological_max=25)
     print(f"ABP — {len(abp_peaks)} peaks after re-detection")
     print(f"CVP — {len(cvp_peaks)} peaks after re-detection")
 
@@ -285,6 +302,7 @@ def run_pipeline(filepath):
         abp_flush=abp_flush,         abp_cal=abp_cal,
         abp_flush_thr=abp_flush_thr, abp_cal_thr=abp_cal_thr,
         cvp_flush=cvp_flush,         cvp_flush_thr=cvp_flush_thr,
+        cvp_infuus=cvp_infuus,       cvp_hp=cvp_hp,
         abp_gasbubble=abp_gasbubble,
         abp_avg_sys=abp_avg_sys,     abp_avg_dia=abp_avg_dia,
     )
