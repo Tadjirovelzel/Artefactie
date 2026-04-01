@@ -21,6 +21,7 @@ import numpy as np
 import os
 import matplotlib.pyplot as plt
 from scipy.signal import spectrogram
+from detectie import compute_fft, detect_peaks_abp
 
 def get_project_root() -> Path:
     if "__file__" in globals():
@@ -77,27 +78,69 @@ frange = [0, 10] # frequency range of interest (Hz)
 
 t, ABP, CVP = read_Artefacts(path, folder, filename, fs)
 
-# Spectrogram
-frequencies, times, Sxx = spectrogram(ABP, fs, nperseg=int(resolution * fs), noverlap=0, nfft=int(fs * resolution))
-Sxx_db = 10 * np.log10(Sxx)  # omzetten naar decibel
-Amplitude = np.mean(np.abs(Sxx[(frequencies >= frange[0]) & (frequencies <= frange[1]), :]), axis=0)
+# FFT
+abp_fft_freqs, abp_fft_mags, abp_dominant_freq = compute_fft(ABP, fs, frange=(0.5, 10))
+cvp_fft_freqs, cvp_fft_mags, cvp_dominant_freq = compute_fft(CVP, fs, frange=(0.5, 10))
 
-fig, (ax1, ax3) = plt.subplots(2, 1, figsize=(10, 6))
+# Peak detection
+abp_peaks, abp_dominant_freq, abp_prominence = detect_peaks_abp(ABP, fs)
+cvp_peaks, cvp_dominant_freq, cvp_prominence = detect_peaks_abp(CVP, fs)
+print(f"ABP — Dominant: {abp_dominant_freq:.2f} Hz ({abp_dominant_freq * 60:.0f} bpm), Peaks: {len(abp_peaks)}, Prominence threshold: {abp_prominence:.2f}")
+print(f"CVP — Dominant: {cvp_dominant_freq:.2f} Hz ({cvp_dominant_freq * 60:.0f} bpm), Peaks: {len(cvp_peaks)}, Prominence threshold: {cvp_prominence:.2f}")
+
+# Spectrograms
+abp_freqs, abp_times, abp_Sxx = spectrogram(ABP, fs, nperseg=int(resolution * fs), noverlap=0, nfft=int(fs * resolution))
+cvp_freqs, cvp_times, cvp_Sxx = spectrogram(CVP, fs, nperseg=int(resolution * fs), noverlap=0, nfft=int(fs * resolution))
+abp_Sxx_db = 10 * np.log10(abp_Sxx)
+cvp_Sxx_db = 10 * np.log10(cvp_Sxx)
+
+fig, axes = plt.subplots(3, 2, figsize=(14, 10))
 fig.suptitle(f"{folder} - {filename}")
 
-ax1.plot(t, ABP, label="ABP")
-ax1.plot(t, CVP, label="CVP")
-ax1.set_title("Arterial Blood Pressure (ABP) & Central Venous Pressure (CVP)")
-ax1.set_xlabel("Time (s)")
-ax1.set_ylabel("Pressure (mmHg)")
-ax1.legend()
+# Row 1: Time series
+axes[0, 0].plot(t, ABP)
+axes[0, 0].plot(t[abp_peaks], ABP[abp_peaks], "x", color="red", label=f"Peaks (n={len(abp_peaks)})")
+axes[0, 0].set_title("Arterial Blood Pressure (ABP)")
+axes[0, 0].set_xlabel("Time (s)")
+axes[0, 0].set_ylabel("ABP (mmHg)")
+axes[0, 0].legend()
 
-im = ax3.pcolormesh(times, frequencies, Sxx_db, shading="auto", cmap="viridis")
-ax3.set_ylim(frange)
-ax3.set_title("ABP Spectrogram")
-ax3.set_xlabel("Time (s)")
-ax3.set_ylabel("Frequency (Hz)")
-fig.colorbar(im, ax=ax3, label="Power (dB)")
+axes[0, 1].plot(t, CVP, color="tab:orange")
+axes[0, 1].plot(t[cvp_peaks], CVP[cvp_peaks], "x", color="red", label=f"Peaks (n={len(cvp_peaks)})")
+axes[0, 1].set_title("Central Venous Pressure (CVP)")
+axes[0, 1].set_xlabel("Time (s)")
+axes[0, 1].set_ylabel("CVP (mmHg)")
+axes[0, 1].legend()
+
+# Row 2: FFT
+axes[1, 0].plot(abp_fft_freqs, abp_fft_mags)
+axes[1, 0].axvline(abp_dominant_freq, color="red", linestyle="--", label=f"Dominant: {abp_dominant_freq:.2f} Hz ({abp_dominant_freq * 60:.0f} bpm)")
+axes[1, 0].set_title("ABP Frequency Spectrum (FFT)")
+axes[1, 0].set_xlabel("Frequency (Hz)")
+axes[1, 0].set_ylabel("Magnitude (mmHg)")
+axes[1, 0].legend()
+
+axes[1, 1].plot(cvp_fft_freqs, cvp_fft_mags, color="tab:orange")
+axes[1, 1].axvline(cvp_dominant_freq, color="red", linestyle="--", label=f"Dominant: {cvp_dominant_freq:.2f} Hz ({cvp_dominant_freq * 60:.0f} bpm)")
+axes[1, 1].set_title("CVP Frequency Spectrum (FFT)")
+axes[1, 1].set_xlabel("Frequency (Hz)")
+axes[1, 1].set_ylabel("Magnitude (mmHg)")
+axes[1, 1].legend()
+
+# Row 3: Spectrograms
+im_abp = axes[2, 0].pcolormesh(abp_times, abp_freqs, abp_Sxx_db, shading="auto", cmap="viridis")
+axes[2, 0].set_ylim(frange)
+axes[2, 0].set_title("ABP Spectrogram")
+axes[2, 0].set_xlabel("Time (s)")
+axes[2, 0].set_ylabel("Frequency (Hz)")
+fig.colorbar(im_abp, ax=axes[2, 0], label="Power (dB)")
+
+im_cvp = axes[2, 1].pcolormesh(cvp_times, cvp_freqs, cvp_Sxx_db, shading="auto", cmap="viridis")
+axes[2, 1].set_ylim(frange)
+axes[2, 1].set_title("CVP Spectrogram")
+axes[2, 1].set_xlabel("Time (s)")
+axes[2, 1].set_ylabel("Frequency (Hz)")
+fig.colorbar(im_cvp, ax=axes[2, 1], label="Power (dB)")
 
 plt.tight_layout()
 plt.show()
