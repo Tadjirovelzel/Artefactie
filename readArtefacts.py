@@ -1,51 +1,73 @@
-'''
-Model with function to load artefact data from Excel .xls and .xlsx files and splits 
-data in separate vectors to process. Written for KT3401 - Assignment Artefact Detection
+"""
+readArtefacts.py — Data loading, artefact detection pipeline, and visualisation.
 
-'''
-# #%% Clear system
-# from IPython import get_ipython
-# # Clear all variables (IPython/Jupyter)
-# get_ipython().magic('reset -sf')
-# import matplotlib.pyplot as plt
-# # Close all figures
-# plt.close('all')
-# import os
-# # Clear the console
-# os.system('cls' if os.name == 'nt' else 'clear')e
+Loads ABP and CVP pressure signals from Excel files, runs the full artefact
+detection pipeline (flush, calibration, gas bubble), and displays a 3×2
+figure with time series, FFT spectra, and spectrograms.
 
-#%% Import modules
+A file-selector dialog opens on startup; closing a figure reopens the selector.
+Written for KT3401 - Assignment Artefact Detection.
+"""
+
+# ---------------------------------------------------------------------------
+# Imports
+# ---------------------------------------------------------------------------
+
 from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog
-import pandas as pd
+
 import numpy as np
-import os
+import pandas as pd
 import matplotlib.pyplot as plt
 from scipy.signal import spectrogram
-from detectie import compute_fft, detect_peaks_abp, detect_artifacts, redetect_peaks_clean, detect_gasbubble
 
-def get_project_root() -> Path:
+from detectie import (
+    compute_fft,
+    detect_peaks_abp,
+    detect_artifacts,
+    redetect_peaks_clean,
+    detect_gasbubble,
+)
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+def _get_project_root() -> Path:
     if "__file__" in globals():
         return Path(__file__).resolve().parent
     return Path.cwd()
 
-project_root = get_project_root()
-data_path = project_root / "data" / "KT3401_AFdata_2025"
-fs = 100
-resolution = 1    # seconds per spectrogram window
-frange = [0, 10]  # frequency range of interest (Hz)
+
+DATA_PATH  = _get_project_root() / "data" / "KT3401_AFdata_2025"
+FS         = 100    # sampling rate (Hz)
+RESOLUTION = 1      # spectrogram window length (s)
+FRANGE     = [0, 10]  # spectrogram frequency range of interest (Hz)
 
 
-def read_Artefacts(filepath, fs):
+# ---------------------------------------------------------------------------
+# Data loading
+# ---------------------------------------------------------------------------
+
+def read_artefacts(filepath, fs):
     """
-    Inputs:
-    filepath: full path to the Excel file
-    fs: sampling rate (in Hz)
+    Load ABP and CVP signals from an Excel file.
 
-    Outputs:
-    t: time vector based on length of signal
-    ABP, CVP: arterial and venous pressure vectors
+    The file is expected to have ABP in column 2 and CVP in column 3
+    (0-indexed), with the first two rows containing metadata.
+
+    Parameters
+    ----------
+    filepath : str or Path  full path to the .xlsx / .xls file
+    fs       : float        sampling rate (Hz)
+
+    Returns
+    -------
+    t   : 1D array  time vector (s)
+    ABP : 1D array  arterial blood pressure (mmHg)
+    CVP : 1D array  central venous pressure (mmHg)
+    Returns (None, None, None) if the file is not found.
     """
     try:
         raw = pd.read_excel(filepath, sheet_name=0, header=None)
@@ -53,123 +75,136 @@ def read_Artefacts(filepath, fs):
         print(f"Error: {e}")
         return None, None, None
 
-    raw = raw.iloc[2:, :]
-    data = raw.to_numpy()
-    ABP = pd.to_numeric(data[:, 1], errors="coerce")
-    CVP = pd.to_numeric(data[:, 2], errors="coerce")
-    t = np.arange(1 / fs, len(ABP) / fs + 1 / fs, 1 / fs)
+    data = raw.iloc[2:, :].to_numpy()
+    ABP  = pd.to_numeric(data[:, 1], errors="coerce")
+    CVP  = pd.to_numeric(data[:, 2], errors="coerce")
+    t    = np.arange(1 / fs, len(ABP) / fs + 1 / fs, 1 / fs)
     return t, ABP, CVP
 
 
-def run_pipeline(filepath):
-    filepath = Path(filepath)
-    folder = filepath.parent.name
-    filename = filepath.name
-    print(f"\nLoading: {folder}/{filename}")
+# ---------------------------------------------------------------------------
+# Visualisation helpers
+# ---------------------------------------------------------------------------
 
-    t, ABP, CVP = read_Artefacts(filepath, fs)
-    if t is None:
-        return
+def shade_artifacts(ax, t, flush_periods, cal_periods, gasbubble_periods):
+    """
+    Shade artefact periods on a time-series axis.
 
-    # FFT
-    abp_fft_freqs, abp_fft_mags, abp_dominant_freq = compute_fft(ABP, fs, frange=(0.5, 10))
-    cvp_fft_freqs, cvp_fft_mags, cvp_dominant_freq = compute_fft(CVP, fs, frange=(0.5, 10))
+    Flush artefacts are shaded red, calibration artefacts blue, and gas-bubble
+    artefacts green. Duplicate legend entries are automatically removed.
 
-    # Peak detection
-    abp_peaks, abp_dominant_freq, abp_prominence = detect_peaks_abp(ABP, fs)
-    cvp_peaks, cvp_dominant_freq, cvp_prominence = detect_peaks_abp(CVP, fs)
-    print(f"ABP — Dominant: {abp_dominant_freq:.2f} Hz ({abp_dominant_freq * 60:.0f} bpm), Peaks: {len(abp_peaks)}, Prominence threshold: {abp_prominence:.2f}")
-    print(f"CVP — Dominant: {cvp_dominant_freq:.2f} Hz ({cvp_dominant_freq * 60:.0f} bpm), Peaks: {len(cvp_peaks)}, Prominence threshold: {cvp_prominence:.2f}")
+    Parameters
+    ----------
+    ax                : matplotlib Axes
+    t                 : 1D array  time vector (s)
+    flush_periods     : list of (start_idx, end_idx) tuples
+    cal_periods       : list of (start_idx, end_idx) tuples
+    gasbubble_periods : list of (start_idx, end_idx) tuples
+    """
+    for s, e in flush_periods:
+        ax.axvspan(t[s], t[min(e, len(t) - 1)], color="red",   alpha=0.2, label="Flush type artifact")
+    for s, e in cal_periods:
+        ax.axvspan(t[s], t[min(e, len(t) - 1)], color="blue",  alpha=0.2, label="Calibration artifact")
+    for s, e in gasbubble_periods:
+        ax.axvspan(t[s], t[min(e, len(t) - 1)], color="green", alpha=0.2, label="Gasbubble artifact")
 
-    # Artifact detection (initial peaks used only for thresholds)
-    abp_flush, abp_cal, abp_flush_thr, abp_cal_thr = detect_artifacts(ABP, fs, abp_dominant_freq, abp_peaks)
-    cvp_flush, _, cvp_flush_thr, _ = detect_artifacts(CVP, fs, cvp_dominant_freq, cvp_peaks)
-    cvp_cal = []  # calibration detection only for ABP
-    print(f"ABP — Flush artifacts: {len(abp_flush)}, Calibration artifacts: {len(abp_cal)}")
-    print(f"CVP — Flush artifacts: {len(cvp_flush)}")
+    handles, labels = ax.get_legend_handles_labels()
+    unique = {}
+    for h, l in zip(handles, labels):
+        unique.setdefault(l, h)
+    ax.legend(unique.values(), unique.keys())
 
-    # Re-run peak detection on clean sections only (excluding flush + cal artifacts)
-    abp_peaks = redetect_peaks_clean(ABP, fs, abp_dominant_freq, abp_flush + abp_cal)
-    cvp_peaks = redetect_peaks_clean(CVP, fs, cvp_dominant_freq, cvp_flush + cvp_cal)
-    print(f"ABP — Peaks after re-detection: {len(abp_peaks)}")
-    print(f"CVP — Peaks after re-detection: {len(cvp_peaks)}")
 
-    # Gasbubble detection using clean peaks
-    abp_gasbubble, abp_avg_sys, abp_avg_dia = detect_gasbubble(ABP, fs, abp_dominant_freq, abp_peaks, artifact_periods=abp_flush + abp_cal)
-    print(f"ABP — Gasbubble artifacts: {len(abp_gasbubble)} (avg sys: {abp_avg_sys:.1f}, avg dia: {abp_avg_dia:.1f})")
+def plot_results(t, ABP, CVP, results, folder, filename):
+    """
+    Render the 3×2 analysis figure.
 
-    # Spectrograms
-    abp_freqs, abp_times, abp_Sxx = spectrogram(ABP, fs, nperseg=int(resolution * fs), noverlap=0, nfft=int(fs * resolution))
-    cvp_freqs, cvp_times, cvp_Sxx = spectrogram(CVP, fs, nperseg=int(resolution * fs), noverlap=0, nfft=int(fs * resolution))
-    abp_Sxx_db = 10 * np.log10(abp_Sxx)
-    cvp_Sxx_db = 10 * np.log10(cvp_Sxx)
+    Layout:
+      Row 1 — ABP time series with detected peaks and artefact shading
+              CVP time series with detected peaks and artefact shading
+      Row 2 — ABP FFT magnitude spectrum
+              CVP FFT magnitude spectrum
+      Row 3 — ABP spectrogram
+              CVP spectrogram
 
+    Parameters
+    ----------
+    t        : 1D array  time vector (s)
+    ABP, CVP : 1D arrays pressure signals (mmHg)
+    results  : dict      output of run_pipeline (keys documented there)
+    folder   : str       parent folder name (used in figure title)
+    filename : str       file name (used in figure title)
+    """
     fig, axes = plt.subplots(3, 2, figsize=(14, 10))
     fig.suptitle(f"{folder} — {filename}")
 
-    def shade_artifacts(ax, t, flush_periods, cal_periods, gasbubble_periods):
-        for s, e in flush_periods:
-            ax.axvspan(t[s], t[min(e, len(t) - 1)], color="red", alpha=0.2,
-                       label="Flush type artifact")
-        for s, e in cal_periods:
-            ax.axvspan(t[s], t[min(e, len(t) - 1)], color="blue", alpha=0.2,
-                       label="Calibration artifact")
-        for s, e in gasbubble_periods:
-            ax.axvspan(t[s], t[min(e, len(t) - 1)], color="green", alpha=0.2,
-                       label="Gasbubble artifact")
-        # Deduplicate legend entries
-        handles, labels = ax.get_legend_handles_labels()
-        seen = {}
-        for h, l in zip(handles, labels):
-            seen.setdefault(l, h)
-        ax.legend(seen.values(), seen.keys())
+    # --- Row 1: Time series ---
+    ax = axes[0, 0]
+    ax.plot(t, ABP)
+    ax.plot(t[results["abp_peaks"]], ABP[results["abp_peaks"]], "x", color="red",
+            label=f"Peaks (n={len(results['abp_peaks'])})")
+    ax.axhline(results["abp_flush_thr"], color="red",       linestyle=":", linewidth=0.8,
+               label=f"Flush threshold ({results['abp_flush_thr']:.1f} mmHg)")
+    ax.axhline(results["abp_cal_thr"],   color="blue",      linestyle=":", linewidth=0.8,
+               label=f"Cal. threshold ({results['abp_cal_thr']:.1f} mmHg)")
+    ax.axhline(results["abp_avg_sys"],   color="green",     linestyle=":", linewidth=0.8,
+               label=f"Avg systolic ({results['abp_avg_sys']:.1f} mmHg)")
+    ax.axhline(results["abp_avg_dia"],   color="darkgreen", linestyle=":", linewidth=0.8,
+               label=f"Avg diastolic ({results['abp_avg_dia']:.1f} mmHg)")
+    shade_artifacts(ax, t, results["abp_flush"], results["abp_cal"], results["abp_gasbubble"])
+    ax.set_title("Arterial Blood Pressure (ABP)")
+    ax.set_xlabel("Time (s)")
+    ax.set_ylabel("ABP (mmHg)")
 
-    # Row 1: Time series
-    axes[0, 0].plot(t, ABP)
-    axes[0, 0].plot(t[abp_peaks], ABP[abp_peaks], "x", color="red", label=f"Peaks (n={len(abp_peaks)})")
-    axes[0, 0].axhline(abp_flush_thr, color="red", linestyle=":", linewidth=0.8, label=f"Flush threshold ({abp_flush_thr:.1f} mmHg)")
-    axes[0, 0].axhline(abp_cal_thr, color="blue", linestyle=":", linewidth=0.8, label=f"Cal. threshold 0.25× avg peak ({abp_cal_thr:.1f} mmHg)")
-    axes[0, 0].axhline(abp_avg_sys, color="green", linestyle=":", linewidth=0.8, label=f"Avg systolic ({abp_avg_sys:.1f} mmHg)")
-    axes[0, 0].axhline(abp_avg_dia, color="darkgreen", linestyle=":", linewidth=0.8, label=f"Avg diastolic ({abp_avg_dia:.1f} mmHg)")
-    shade_artifacts(axes[0, 0], t, abp_flush, abp_cal, abp_gasbubble)
-    axes[0, 0].set_title("Arterial Blood Pressure (ABP)")
-    axes[0, 0].set_xlabel("Time (s)")
-    axes[0, 0].set_ylabel("ABP (mmHg)")
+    ax = axes[0, 1]
+    ax.plot(t, CVP, color="tab:orange")
+    ax.plot(t[results["cvp_peaks"]], CVP[results["cvp_peaks"]], "x", color="red",
+            label=f"Peaks (n={len(results['cvp_peaks'])})")
+    ax.axhline(results["cvp_flush_thr"], color="red", linestyle=":", linewidth=0.8,
+               label=f"Flush threshold ({results['cvp_flush_thr']:.1f} mmHg)")
+    shade_artifacts(ax, t, results["cvp_flush"], [], [])
+    ax.set_title("Central Venous Pressure (CVP)")
+    ax.set_xlabel("Time (s)")
+    ax.set_ylabel("CVP (mmHg)")
 
-    axes[0, 1].plot(t, CVP, color="tab:orange")
-    axes[0, 1].plot(t[cvp_peaks], CVP[cvp_peaks], "x", color="red", label=f"Peaks (n={len(cvp_peaks)})")
-    axes[0, 1].axhline(cvp_flush_thr, color="red", linestyle=":", linewidth=0.8, label=f"Flush threshold ({cvp_flush_thr:.1f} mmHg)")
+    # --- Row 2: FFT spectra ---
+    ax = axes[1, 0]
+    ax.plot(results["abp_fft_freqs"], results["abp_fft_mags"])
+    ax.axvline(results["abp_dominant_freq"], color="red", linestyle="--",
+               label=f"Dominant: {results['abp_dominant_freq']:.2f} Hz "
+                     f"({results['abp_dominant_freq'] * 60:.0f} bpm)")
+    ax.set_title("ABP Frequency Spectrum (FFT)")
+    ax.set_xlabel("Frequency (Hz)")
+    ax.set_ylabel("Magnitude (mmHg)")
+    ax.legend()
 
-    shade_artifacts(axes[0, 1], t, cvp_flush, cvp_cal, [])
-    axes[0, 1].set_title("Central Venous Pressure (CVP)")
-    axes[0, 1].set_xlabel("Time (s)")
-    axes[0, 1].set_ylabel("CVP (mmHg)")
+    ax = axes[1, 1]
+    ax.plot(results["cvp_fft_freqs"], results["cvp_fft_mags"], color="tab:orange")
+    ax.axvline(results["cvp_dominant_freq"], color="red", linestyle="--",
+               label=f"Dominant: {results['cvp_dominant_freq']:.2f} Hz "
+                     f"({results['cvp_dominant_freq'] * 60:.0f} bpm)")
+    ax.set_title("CVP Frequency Spectrum (FFT)")
+    ax.set_xlabel("Frequency (Hz)")
+    ax.set_ylabel("Magnitude (mmHg)")
+    ax.legend()
 
-    # Row 2: FFT
-    axes[1, 0].plot(abp_fft_freqs, abp_fft_mags)
-    axes[1, 0].axvline(abp_dominant_freq, color="red", linestyle="--", label=f"Dominant: {abp_dominant_freq:.2f} Hz ({abp_dominant_freq * 60:.0f} bpm)")
-    axes[1, 0].set_title("ABP Frequency Spectrum (FFT)")
-    axes[1, 0].set_xlabel("Frequency (Hz)")
-    axes[1, 0].set_ylabel("Magnitude (mmHg)")
-    axes[1, 0].legend()
+    # --- Row 3: Spectrograms ---
+    abp_freqs, abp_times, abp_Sxx = spectrogram(
+        ABP, FS, nperseg=int(RESOLUTION * FS), noverlap=0, nfft=int(FS * RESOLUTION))
+    cvp_freqs, cvp_times, cvp_Sxx = spectrogram(
+        CVP, FS, nperseg=int(RESOLUTION * FS), noverlap=0, nfft=int(FS * RESOLUTION))
 
-    axes[1, 1].plot(cvp_fft_freqs, cvp_fft_mags, color="tab:orange")
-    axes[1, 1].axvline(cvp_dominant_freq, color="red", linestyle="--", label=f"Dominant: {cvp_dominant_freq:.2f} Hz ({cvp_dominant_freq * 60:.0f} bpm)")
-    axes[1, 1].set_title("CVP Frequency Spectrum (FFT)")
-    axes[1, 1].set_xlabel("Frequency (Hz)")
-    axes[1, 1].set_ylabel("Magnitude (mmHg)")
-    axes[1, 1].legend()
-
-    # Row 3: Spectrograms
-    im_abp = axes[2, 0].pcolormesh(abp_times, abp_freqs, abp_Sxx_db, shading="auto", cmap="viridis")
-    axes[2, 0].set_ylim(frange)
+    im_abp = axes[2, 0].pcolormesh(abp_times, abp_freqs, 10 * np.log10(abp_Sxx),
+                                    shading="auto", cmap="viridis")
+    axes[2, 0].set_ylim(FRANGE)
     axes[2, 0].set_title("ABP Spectrogram")
     axes[2, 0].set_xlabel("Time (s)")
     axes[2, 0].set_ylabel("Frequency (Hz)")
     fig.colorbar(im_abp, ax=axes[2, 0], label="Power (dB)")
 
-    im_cvp = axes[2, 1].pcolormesh(cvp_times, cvp_freqs, cvp_Sxx_db, shading="auto", cmap="viridis")
-    axes[2, 1].set_ylim(frange)
+    im_cvp = axes[2, 1].pcolormesh(cvp_times, cvp_freqs, 10 * np.log10(cvp_Sxx),
+                                    shading="auto", cmap="viridis")
+    axes[2, 1].set_ylim(FRANGE)
     axes[2, 1].set_title("CVP Spectrogram")
     axes[2, 1].set_xlabel("Time (s)")
     axes[2, 1].set_ylabel("Frequency (Hz)")
@@ -179,17 +214,98 @@ def run_pipeline(filepath):
     plt.show()
 
 
-#%% Main loop — file selector
-root = tk.Tk()
-root.withdraw()  # hide the empty tkinter window
+# ---------------------------------------------------------------------------
+# Detection pipeline
+# ---------------------------------------------------------------------------
 
-while True:
-    filepath = filedialog.askopenfilename(
-        title="Select a dataset",
-        initialdir=data_path,
-        filetypes=[("Excel files", "*.xlsx *.xls")]
+def run_pipeline(filepath):
+    """
+    Run the full artefact detection pipeline on one file and display results.
+
+    Steps
+    -----
+    1. Load ABP and CVP signals.
+    2. Compute FFT to find dominant cardiac frequency for each signal.
+    3. Initial systolic peak detection (used to establish artefact thresholds).
+    4. Detect flush and calibration artefacts (ABP only for calibration).
+    5. Re-detect peaks on clean signal sections only.
+    6. Detect gas-bubble artefacts using clean peaks.
+    7. Plot all results.
+
+    Parameters
+    ----------
+    filepath : str or Path  full path to the data file
+    """
+    filepath = Path(filepath)
+    folder   = filepath.parent.name
+    filename = filepath.name
+    print(f"\nLoading: {folder}/{filename}")
+
+    t, ABP, CVP = read_artefacts(filepath, FS)
+    if t is None:
+        return
+
+    # Step 2 — FFT
+    abp_fft_freqs, abp_fft_mags, abp_dominant_freq = compute_fft(ABP, FS, frange=(0.5, 10))
+    cvp_fft_freqs, cvp_fft_mags, cvp_dominant_freq = compute_fft(CVP, FS, frange=(0.5, 10))
+
+    # Step 3 — Initial peak detection
+    abp_peaks, abp_dominant_freq, abp_prominence = detect_peaks_abp(ABP, FS)
+    cvp_peaks, cvp_dominant_freq, cvp_prominence = detect_peaks_abp(CVP, FS)
+    print(f"ABP — {abp_dominant_freq:.2f} Hz ({abp_dominant_freq * 60:.0f} bpm), "
+          f"{len(abp_peaks)} peaks")
+    print(f"CVP — {cvp_dominant_freq:.2f} Hz ({cvp_dominant_freq * 60:.0f} bpm), "
+          f"{len(cvp_peaks)} peaks")
+
+    # Step 4 — Artefact detection (calibration for ABP only)
+    abp_flush, abp_cal, abp_flush_thr, abp_cal_thr = detect_artifacts(
+        ABP, FS, abp_dominant_freq, abp_peaks)
+    cvp_flush, _,       cvp_flush_thr, _            = detect_artifacts(
+        CVP, FS, cvp_dominant_freq, cvp_peaks)
+    print(f"ABP — {len(abp_flush)} flush, {len(abp_cal)} calibration artefacts")
+    print(f"CVP — {len(cvp_flush)} flush artefacts")
+
+    # Step 5 — Re-detect peaks on clean sections
+    abp_peaks = redetect_peaks_clean(ABP, FS, abp_dominant_freq, abp_flush + abp_cal)
+    cvp_peaks = redetect_peaks_clean(CVP, FS, cvp_dominant_freq, cvp_flush)
+    print(f"ABP — {len(abp_peaks)} peaks after re-detection")
+    print(f"CVP — {len(cvp_peaks)} peaks after re-detection")
+
+    # Step 6 — Gas-bubble detection (ABP only)
+    abp_gasbubble, abp_avg_sys, abp_avg_dia = detect_gasbubble(
+        ABP, FS, abp_dominant_freq, abp_peaks, artifact_periods=abp_flush + abp_cal)
+    print(f"ABP — {len(abp_gasbubble)} gasbubble artefact(s)")
+
+    # Step 7 — Plot
+    results = dict(
+        abp_peaks=abp_peaks,         cvp_peaks=cvp_peaks,
+        abp_dominant_freq=abp_dominant_freq, cvp_dominant_freq=cvp_dominant_freq,
+        abp_fft_freqs=abp_fft_freqs, abp_fft_mags=abp_fft_mags,
+        cvp_fft_freqs=cvp_fft_freqs, cvp_fft_mags=cvp_fft_mags,
+        abp_flush=abp_flush,         abp_cal=abp_cal,
+        abp_flush_thr=abp_flush_thr, abp_cal_thr=abp_cal_thr,
+        cvp_flush=cvp_flush,         cvp_flush_thr=cvp_flush_thr,
+        abp_gasbubble=abp_gasbubble,
+        abp_avg_sys=abp_avg_sys,     abp_avg_dia=abp_avg_dia,
     )
-    if not filepath:
-        print("No file selected — exiting.")
-        break
-    run_pipeline(filepath)
+    plot_results(t, ABP, CVP, results, folder, filename)
+
+
+# ---------------------------------------------------------------------------
+# Entry point — interactive file selector
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    root.withdraw()
+
+    while True:
+        filepath = filedialog.askopenfilename(
+            title="Select a dataset",
+            initialdir=DATA_PATH,
+            filetypes=[("Excel files", "*.xlsx *.xls")],
+        )
+        if not filepath:
+            print("No file selected — exiting.")
+            break
+        run_pipeline(filepath)
