@@ -75,3 +75,41 @@ def detect_peaks_abp(signal, fs, rms_factor=0.5, hr_range=(0.5, 3.0)):
     peaks, _ = find_peaks(signal, distance=min_distance, prominence=prominence_threshold)
 
     return peaks, dominant_freq, prominence_threshold
+
+
+def detect_artifacts(signal, fs, dominant_freq, peaks, rms_factor=0.5):
+    """
+    Detect flush-type and calibration artifacts based on signal level and duration.
+
+    Flush artifact:       signal stays ABOVE average peak height for > 2x dominant interval
+    Calibration artifact: signal stays BELOW RMS threshold for > 2x dominant interval
+
+    Inputs:
+        signal: 1D numpy array
+        fs: sampling rate (Hz)
+        dominant_freq: dominant cardiac frequency (Hz), used to define the minimum duration
+        peaks: indices of detected systolic peaks (from detect_peaks_abp)
+        rms_factor: calibration threshold = rms_factor * RMS (default 0.5)
+
+    Outputs:
+        flush_periods: list of (start_idx, end_idx) tuples
+        cal_periods:   list of (start_idx, end_idx) tuples
+        flush_threshold: average peak height used for flush detection
+        cal_threshold:   RMS-based threshold used for calibration detection
+    """
+    signal = np.array(signal, dtype=float)
+    min_samples = int(2 * fs / dominant_freq)
+
+    flush_threshold = np.mean(signal[peaks])
+    cal_threshold   = compute_rms(signal) * rms_factor
+
+    def find_periods(mask):
+        changes = np.diff(mask.astype(int), prepend=0, append=0)
+        starts = np.where(changes == 1)[0]
+        ends = np.where(changes == -1)[0]
+        return [(s, e) for s, e in zip(starts, ends) if e - s >= min_samples]
+
+    flush_periods = find_periods(signal > flush_threshold)
+    cal_periods   = find_periods(signal < cal_threshold)
+
+    return flush_periods, cal_periods, flush_threshold, cal_threshold
