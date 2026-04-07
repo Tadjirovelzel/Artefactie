@@ -132,7 +132,7 @@ def plot_results(t, ABP, CVP, results, folder, filename):
               CVP time series with detected peaks and artefact shading
       Row 2 — ABP FFT magnitude spectrum
               CVP FFT magnitude spectrum
-      Row 3 — ABP spectrogram
+      Row 3 — ABP spectrogram 
               CVP spectrogram
 
     Parameters
@@ -254,7 +254,7 @@ def run_pipeline(filepath):
 
     t, ABP, CVP = read_artefacts(filepath, FS)
     if t is None:
-        return
+        raise ValueError("Time is None, indicating file loading failed. Check the file path and format.")
 
     # Step 2 — FFT
     abp_fft_freqs, abp_fft_mags, abp_dominant_freq = compute_fft(ABP, FS, frange=(0.5, 10))
