@@ -1,22 +1,28 @@
 def is_irregular(signal):
     pass
 
+
 def has_abp_cvp_difference(ABP, CVP):
     pass
+
 
 def has_simultaneous_abp_cvp_change(ABP, CVP):
     pass
 
+
 def has_power_change(ABP, CVP):
     pass
+
 
 def has_abp_dominant_freq_change(ABP):
     pass
 
+
 def has_abp_avg_sys_change(ABP):
     pass 
 
-def decision_tree():
+
+def decision_tree(t, ABP, CVP):
     """
     Classify the artefact type based on extracted signal features.
     """

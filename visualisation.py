@@ -19,20 +19,22 @@ FRANGE     = [0, 10]  # spectrogram frequency range of interest (Hz)
 # ---------------------------------------------------------------------------
 # Visualisation functions
 # ---------------------------------------------------------------------------
-def shade_artifacts(ax, t, flush_periods, cal_periods, gasbubble_periods,
-                    infuus_periods=None):
-    """ Shades artefact periods on a time-series axis."""
-    
-    infuus_periods = infuus_periods or [] # why is this necessary
+def shade_artifacts(ax, t, results):
+    """Shade artifact periods on a time-series axis.
+    """
+    artifact_styles = {
+        "flush":       {"color": "red",    "label": "Flush type artifact"},
+        "calibration": {"color": "blue",   "label": "Calibration artifact"},
+        "gasbubble":   {"color": "green",  "label": "Gasbubble artifact"},
+        "infuus":      {"color": "purple", "label": "Infuus artifact"},
+        "slinger":     {"color": "orange", "label": "Slinger artifact"},
+        "Transducer":  {"color": "cyan", "label": "Transducer hoog artifact"},
+    }
 
-    for start, end in flush_periods:
-        ax.axvspan(t[start], t[min(end, len(t) - 1)], color="red",    alpha=0.2, label="Flush type artifact")
-    for start, end in cal_periods:
-        ax.axvspan(t[start], t[min(end, len(t) - 1)], color="blue",   alpha=0.2, label="Calibration artifact")
-    for start, end in gasbubble_periods:
-        ax.axvspan(t[start], t[min(end, len(t) - 1)], color="green",  alpha=0.2, label="Gasbubble artifact")
-    for start, end in infuus_periods:
-        ax.axvspan(t[start], t[min(end, len(t) - 1)], color="purple", alpha=0.2, label="Infuus artifact")
+    for artifact_type, style in artifact_styles.items():
+        periods = results.get(artifact_type, [])
+        for start, end in periods:
+            ax.axvspan(t[start], t[min(end, len(t) - 1)], color=style["color"], alpha=0.2, label=style["label"])
 
     handles, labels = ax.get_legend_handles_labels()
     unique = {}
@@ -56,15 +58,9 @@ def plot_results(t, ABP, CVP, results, folder, filename):
     ax.plot(t, ABP)
     ax.plot(t[results["abp_peaks"]], ABP[results["abp_peaks"]], "x", color="red",
             label=f"Peaks (n={len(results['abp_peaks'])})")
-    ax.axhline(results["abp_flush_thr"], color="red",       linestyle=":", linewidth=0.8,
-               label=f"Flush threshold ({results['abp_flush_thr']:.1f} mmHg)")
-    ax.axhline(results["abp_cal_thr"],   color="blue",      linestyle=":", linewidth=0.8,
-               label=f"Cal. threshold ({results['abp_cal_thr']:.1f} mmHg)")
-    ax.axhline(results["abp_avg_sys"],   color="green",     linestyle=":", linewidth=0.8,
-               label=f"Avg systolic ({results['abp_avg_sys']:.1f} mmHg)")
-    ax.axhline(results["abp_avg_dia"],   color="darkgreen", linestyle=":", linewidth=0.8,
-               label=f"Avg diastolic ({results['abp_avg_dia']:.1f} mmHg)")
+    
     shade_artifacts(ax, t, results["abp_flush"], results["abp_cal"], results["abp_gasbubble"])
+
     ax.set_title("Arterial Blood Pressure (ABP)")
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("ABP (mmHg)")
@@ -75,13 +71,14 @@ def plot_results(t, ABP, CVP, results, folder, filename):
             alpha=0.7, label="CVP (high-pass filtered)")
     ax.plot(t[results["cvp_peaks"]], CVP[results["cvp_peaks"]], "x", color="red",
             label=f"Peaks (n={len(results['cvp_peaks'])})")
-    ax.axhline(results["cvp_flush_thr"], color="red", linestyle=":", linewidth=0.8,
-               label=f"Flush threshold ({results['cvp_flush_thr']:.1f} mmHg)")
+
     shade_artifacts(ax, t, results["cvp_flush"], [], [],
                     infuus_periods=results["cvp_infuus"])
+    
     ax.set_title("Central Venous Pressure (CVP)")
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("CVP (mmHg)")
+
 
     # --- Row 2: FFT spectra ---
     ax = axes[1, 0]

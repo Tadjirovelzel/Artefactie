@@ -15,6 +15,7 @@ from tkinter import filedialog
 
 from readartefacts import read_artefacts
 from visualisation import plot_results
+from decisiontree import decision_tree
 from detectie import (
     compute_fft,
     detect_peaks_abp,
@@ -76,37 +77,10 @@ def run_pipeline(filepath):
     print(f"CVP — {cvp_dominant_freq:.2f} Hz ({cvp_dominant_freq * 60:.0f} bpm), "
           f"{len(cvp_peaks)} peaks")
     
-    
-    ############################################
-    # vanaf hier zou de keuzeboom moeten komen
-    ############################################
-
-    # # Step 4 — Detect flush and calibration artefacts (ABP only for calibration)
-    # abp_flush, abp_cal, abp_flush_thr, abp_cal_thr = detect_artifacts(
-    #     ABP, FS, abp_dominant_freq, abp_peaks)
-    # _, _, cvp_flush_thr, _ = detect_artifacts(
-    #     CVP, FS, cvp_dominant_freq, cvp_peaks, physiological_max=25)
-
-    # # CVP elevated periods are split into infuus vs flush by oscillation check
-    # cvp_infuus, cvp_flush, cvp_hp = detect_infuus_cvp(
-    #     CVP, FS, cvp_dominant_freq, cvp_flush_thr)
-
-    # print(f"ABP — {len(abp_flush)} flush, {len(abp_cal)} calibration artefacts")
-    # print(f"CVP — {len(cvp_flush)} flush, {len(cvp_infuus)} infuus artefacts")
-
-    # # Step 5 — Re-detect peaks on clean signal sections only
-    # abp_peaks = redetect_peaks_clean(ABP, FS, abp_dominant_freq, abp_flush + abp_cal)
-    # cvp_peaks = redetect_peaks_clean(CVP, FS, cvp_dominant_freq, cvp_flush + cvp_infuus,
-    #                                  physiological_max=25)
-    # print(f"ABP — {len(abp_peaks)} peaks after re-detection")
-    # print(f"CVP — {len(cvp_peaks)} peaks after re-detection")
-
-    # # Step 6 — Detect gas-bubble artefacts using clean peaks
-    # abp_gasbubble, abp_avg_sys, abp_avg_dia = detect_gasbubble(
-    #     ABP, FS, abp_dominant_freq, abp_peaks, artifact_periods=abp_flush + abp_cal)
-    # print(f"ABP — {len(abp_gasbubble)} gasbubble artefact(s)")
-
-
+    # ------------------------------------------------
+    # Go threw decision tree
+    # ------------------------------------------------
+    decision_tree(t, ABP, CVP)
 
     # Step 7 — Plot all results
     results = dict(
@@ -114,12 +88,6 @@ def run_pipeline(filepath):
         abp_dominant_freq=abp_dominant_freq, cvp_dominant_freq=cvp_dominant_freq,
         abp_fft_freqs=abp_fft_freqs, abp_fft_mags=abp_fft_mags,
         cvp_fft_freqs=cvp_fft_freqs, cvp_fft_mags=cvp_fft_mags,
-        abp_flush=abp_flush,         abp_cal=abp_cal,
-        abp_flush_thr=abp_flush_thr, abp_cal_thr=abp_cal_thr,
-        cvp_flush=cvp_flush,         cvp_flush_thr=cvp_flush_thr,
-        cvp_infuus=cvp_infuus,       cvp_hp=cvp_hp,
-        abp_gasbubble=abp_gasbubble,
-        abp_avg_sys=abp_avg_sys,     abp_avg_dia=abp_avg_dia,
     )
     plot_results(t, ABP, CVP, results, folder, filename)
 
