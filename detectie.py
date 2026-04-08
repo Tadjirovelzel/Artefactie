@@ -10,8 +10,6 @@ from scipy.signal import find_peaks, butter, filtfilt, welch
 from scipy.integrate import trapezoid
 
 
-
-
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
@@ -287,123 +285,6 @@ def detect_gasbubble(signal, fs, dominant_freq, peaks, artifact_periods=None):
 
     return snapped, avg_systolic, avg_diastolic
 
-
-
-
-
-# def detect_transducer_shift(signal_abp, signal_cvp, fs,
-#                                 lp_cutoff=0.05,
-#                                 k_abp=1.0,
-#                                 k_cvp=1.0,
-#                                 min_duration=2.0):
-#     """
-#     Detecteer transducer-hoog gebied op basis van:
-#     - sterke low-pass baseline
-#     - baseline-daling t.o.v. (median - k * std)
-#     - ABP én CVP moeten beide laag zijn
-
-#     Parameters
-#     ----------
-#     signal_abp, signal_cvp : arrays
-#         Druksignalen
-#     fs : float
-#         Sampling rate
-#     lp_cutoff : float
-#         Low-pass cutoff (Hz)
-#     k_abp, k_cvp : float
-#         Aantal standaarddeviaties onder normaal
-#     min_duration : float
-#         Minimale duur van artefact (s)
-
-#     Returns
-#     -------
-#     periods : list of (start, end)
-#     base_abp, base_cvp : arrays
-#         Low-pass baselines
-#     """
-
-#     # --- 1. Sterke low-pass baseline ---
-#     b, a = butter(4, lp_cutoff / (fs/2), btype="low")
-#     base_abp = filtfilt(b, a, signal_abp)
-#     base_cvp = filtfilt(b, a, signal_cvp)
-
-#     # --- 2. Normale baseline + variatie ---
-#     med_abp = np.median(base_abp)
-#     med_cvp = np.median(base_cvp)
-
-#     sd_abp = np.std(base_abp)
-#     sd_cvp = np.std(base_cvp)
-
-#     # --- 3. SD-gebaseerde daling ---
-#     mask_abp = base_abp < (med_abp - k_abp * sd_abp)
-#     mask_cvp = base_cvp < (med_cvp - k_cvp * sd_cvp)
-
-#     # --- 4. Combineer: ABP én CVP moeten laag zijn ---
-#     final_mask = mask_abp & mask_cvp
-
-#     # --- 5. Vind periodes ---
-#     min_samples = int(min_duration * fs)
-#     periods = _find_periods(final_mask, min_samples)
-
-#     return periods, base_abp, base_cvp
-
-# def detect_transducer_shift(abp, cvp, fs,
-#                             lp_cutoff=0.05,
-#                             k_baseline=0.4,
-#                             min_duration=2.0,
-#                             band_width=0.4,
-#                             power_ratio_min=0.05,
-#                             recovery_time=10.0):
-
-#     # --- 1. Low-pass baseline ---
-#     b, a = butter(4, lp_cutoff / (fs/2), btype="low")
-#     base_abp = filtfilt(b, a, abp)
-#     base_cvp = filtfilt(b, a, cvp)
-
-#     # --- 2. Baseline-daling ---
-#     abp_low = base_abp < (np.median(base_abp) - k_baseline * np.std(base_abp))
-#     cvp_low = base_cvp < (np.median(base_cvp) - k_baseline * np.std(base_cvp))
-
-#     # --- 3. Dominante hartslagfrequentie ---
-#     f, Pxx = welch(abp, fs, nperseg=4*fs)
-#     dom = f[np.argmax(Pxx)]
-
-#     # --- 4. Sliding bandpower ---
-#     win = int(2 * fs)
-#     bp = np.zeros_like(abp)
-#     for i in range(len(abp) - win):
-#         seg = abp[i:i+win]
-#         f2, P2 = welch(seg, fs, nperseg=win)
-#         mask = (f2 > dom - band_width) & (f2 < dom + band_width)
-#         bp[i:i+win] = trapezoid(P2[mask], f2[mask])
-
-#     # normale bandpower
-#     bp_norm = np.median(bp)
-#     bp_ok = bp > (power_ratio_min * bp_norm)
-
-#     # --- 5. State machine: calibratie-blokkade ---
-#     state = np.zeros(len(abp), dtype=int)  # 0=NORMAL, 1=CALIB
-#     state[~bp_ok] = 1
-#     print("abp_low true:", np.mean(abp_low))
-#     print("cvp_low true:", np.mean(cvp_low))
-#     print("bp_ok true:", np.mean(bp_ok))
-
-#     # herstel pas na X seconden stabiel bp_ok
-#     rec = int(recovery_time * fs)
-#     for i in range(1, len(state)):
-#         if state[i] == 0 and state[i-1] == 1:
-#             if not np.all(bp_ok[i:i+rec]):
-#                 state[i] = 1
-
-#     # --- 6. Transducer shift alleen in NORMAL state ---
-#     candidate = abp_low & cvp_low & bp_ok
-#     final_mask = candidate & (state == 0)
-
-#     # --- 7. Periodes ---
-#     min_samples = int(min_duration * fs)
-#     periods = _find_periods(final_mask, min_samples)
-
-#     return periods, base_abp, base_cvp
 
 def detect_transducer_shift(abp, cvp, fs,
                             lp_cutoff=0.05,
