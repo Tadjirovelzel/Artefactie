@@ -116,7 +116,7 @@ def detect_artifacts(signal, fs, dominant_freq, peaks, physiological_max=None):
                           driving the signal to ~0 mmHg.)
     """
     signal      = np.asarray(signal, dtype=float)
-    min_samples = int(2 * fs / dominant_freq)
+    min_samples = int(fs / dominant_freq)
 
     peak_heights = signal[peaks]
     if physiological_max is not None:
