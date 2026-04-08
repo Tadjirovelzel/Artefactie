@@ -101,7 +101,7 @@ def compute_fft(signal, fs, frange=(0.5, 10)):
 
     freqs      = np.fft.rfftfreq(N, d=1 / fs)
     magnitudes = np.abs(np.fft.rfft(signal)) / N
-
+ 
     band = (freqs >= frange[0]) & (freqs <= frange[1])
     freqs      = freqs[band]
     magnitudes = magnitudes[band]
