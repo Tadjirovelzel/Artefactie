@@ -48,7 +48,9 @@ def run_pipeline(filepath):
     """
     Run the full artefact detection pipeline on one file and display results.
     """
-    # Step 1 — Load ABP and CVP signals
+    # ------------------------------------------------
+    # Load ABP and CVP signals
+    # ------------------------------------------------
     filepath = Path(filepath)
     folder   = filepath.parent.name
     filename = filepath.name
@@ -58,11 +60,15 @@ def run_pipeline(filepath):
     if t is None:
         raise ValueError("Time is None, indicating file loading failed. Check the file path and format.")
 
-    # Step 2 — Compute FFT to find dominant cardiac frequency for each signal
+    # ------------------------------------------------
+    # Initial analysis: FFT and peak detection to establish artefact thresholds
+    # ------------------------------------------------
+
+    # Compute FFT to find dominant cardiac frequency for each signal
     abp_fft_freqs, abp_fft_mags, abp_dominant_freq = compute_fft(ABP, FS, frange=(0.5, 10))
     cvp_fft_freqs, cvp_fft_mags, cvp_dominant_freq = compute_fft(CVP, FS, frange=(0.5, 10))
 
-    # Step 3 — Initial systolic peak detection (used to establish artefact thresholds)
+    # Initial systolic peak detection (used to establish artefact thresholds)
     abp_peaks, abp_dominant_freq, abp_prominence = detect_peaks_abp(ABP, FS)
     cvp_peaks, cvp_dominant_freq, cvp_prominence = detect_peaks_abp(CVP, FS, physiological_max=25)
     print(f"ABP — {abp_dominant_freq:.2f} Hz ({abp_dominant_freq * 60:.0f} bpm), "
@@ -75,30 +81,32 @@ def run_pipeline(filepath):
     # vanaf hier zou de keuzeboom moeten komen
     ############################################
 
-    # Step 4 — Detect flush and calibration artefacts (ABP only for calibration)
-    abp_flush, abp_cal, abp_flush_thr, abp_cal_thr = detect_artifacts(
-        ABP, FS, abp_dominant_freq, abp_peaks)
-    _, _, cvp_flush_thr, _ = detect_artifacts(
-        CVP, FS, cvp_dominant_freq, cvp_peaks, physiological_max=25)
+    # # Step 4 — Detect flush and calibration artefacts (ABP only for calibration)
+    # abp_flush, abp_cal, abp_flush_thr, abp_cal_thr = detect_artifacts(
+    #     ABP, FS, abp_dominant_freq, abp_peaks)
+    # _, _, cvp_flush_thr, _ = detect_artifacts(
+    #     CVP, FS, cvp_dominant_freq, cvp_peaks, physiological_max=25)
 
-    # CVP elevated periods are split into infuus vs flush by oscillation check
-    cvp_infuus, cvp_flush, cvp_hp = detect_infuus_cvp(
-        CVP, FS, cvp_dominant_freq, cvp_flush_thr)
+    # # CVP elevated periods are split into infuus vs flush by oscillation check
+    # cvp_infuus, cvp_flush, cvp_hp = detect_infuus_cvp(
+    #     CVP, FS, cvp_dominant_freq, cvp_flush_thr)
 
-    print(f"ABP — {len(abp_flush)} flush, {len(abp_cal)} calibration artefacts")
-    print(f"CVP — {len(cvp_flush)} flush, {len(cvp_infuus)} infuus artefacts")
+    # print(f"ABP — {len(abp_flush)} flush, {len(abp_cal)} calibration artefacts")
+    # print(f"CVP — {len(cvp_flush)} flush, {len(cvp_infuus)} infuus artefacts")
 
-    # Step 5 — Re-detect peaks on clean signal sections only
-    abp_peaks = redetect_peaks_clean(ABP, FS, abp_dominant_freq, abp_flush + abp_cal)
-    cvp_peaks = redetect_peaks_clean(CVP, FS, cvp_dominant_freq, cvp_flush + cvp_infuus,
-                                     physiological_max=25)
-    print(f"ABP — {len(abp_peaks)} peaks after re-detection")
-    print(f"CVP — {len(cvp_peaks)} peaks after re-detection")
+    # # Step 5 — Re-detect peaks on clean signal sections only
+    # abp_peaks = redetect_peaks_clean(ABP, FS, abp_dominant_freq, abp_flush + abp_cal)
+    # cvp_peaks = redetect_peaks_clean(CVP, FS, cvp_dominant_freq, cvp_flush + cvp_infuus,
+    #                                  physiological_max=25)
+    # print(f"ABP — {len(abp_peaks)} peaks after re-detection")
+    # print(f"CVP — {len(cvp_peaks)} peaks after re-detection")
 
-    # Step 6 — Detect gas-bubble artefacts using clean peaks
-    abp_gasbubble, abp_avg_sys, abp_avg_dia = detect_gasbubble(
-        ABP, FS, abp_dominant_freq, abp_peaks, artifact_periods=abp_flush + abp_cal)
-    print(f"ABP — {len(abp_gasbubble)} gasbubble artefact(s)")
+    # # Step 6 — Detect gas-bubble artefacts using clean peaks
+    # abp_gasbubble, abp_avg_sys, abp_avg_dia = detect_gasbubble(
+    #     ABP, FS, abp_dominant_freq, abp_peaks, artifact_periods=abp_flush + abp_cal)
+    # print(f"ABP — {len(abp_gasbubble)} gasbubble artefact(s)")
+
+
 
     # Step 7 — Plot all results
     results = dict(
