@@ -6,7 +6,7 @@ flush, calibration, and gas bubble artefacts. Written for KT3401 - Artefact Dete
 """
 
 import numpy as np
-from scipy.signal import find_peaks, butter, filtfilt
+from scipy.signal import find_peaks, butter, filtfilt, spectrogram
 
 
 # ---------------------------------------------------------------------------
@@ -408,3 +408,145 @@ def detect_gasbubble(signal, fs, dominant_freq, peaks, artifact_periods=None):
         snapped.append((new_s, e))
 
     return snapped, avg_systolic, avg_diastolic
+
+
+def detect_slinger(signal, fs, dominant_freq, peaks, artifact_periods=None):
+    """
+    Detect slinger (resonance/ringing) artefacts.
+
+    A slinger artefact occurs when the catheter/transducer system resonates,
+    creating oscillation peaks at a higher frequency than the normal cardiac
+    cycle. Three complementary criteria are combined:
+
+    1. Short-interval peaks: consecutive peaks detected at a short min-distance
+       (15 % of the cardiac cycle) whose inter-peak interval is less than 55 %
+       of the cardiac cycle are flagged.  Both peaks must exceed 65 % of the
+       average systolic height to exclude the dicrotic wave (~50-56 % of
+       systolic) and sub-threshold noise.
+
+    2. Tall peaks: isolated peaks that exceed 1.5 × the average systolic height
+       indicate burst ringing.  A window of one full cardiac interval is flagged
+       around each such peak.
+
+    3. Spectral power: per-second spectrogram windows in which power above
+       2 × dominant_freq (up to 15 Hz) exceeds an adaptive threshold
+       (max(0.75, median + 3 × std) of the signal's own ringing fraction).
+       This catches clear high-frequency ringing while adapting to signals
+       with naturally high harmonic content (e.g., prominent dicrotic waves).
+
+    Periods satisfying at least one criterion for more than 2 × the cardiac
+    interval are kept, and adjacent segments within 6 cardiac intervals are
+    merged.
+
+    Parameters
+    ----------
+    signal           : 1D array-like
+    fs               : float  sampling rate (Hz)
+    dominant_freq    : float  dominant cardiac frequency (Hz)
+    peaks            : array  systolic peak indices (from detect_peaks_abp or
+                       redetect_peaks_clean)
+    artifact_periods : list of (start_idx, end_idx) tuples to exclude (optional)
+
+    Returns
+    -------
+    slinger_periods  : list of (start_idx, end_idx) tuples
+    avg_peak_height  : float  average systolic height used as threshold (mmHg)
+    spec_times       : 1D array  spectrogram window centre times (s)
+    spec_ringing_frac: 1D array  ringing power fraction at each window
+    """
+    signal           = np.asarray(signal, dtype=float)
+    artifact_periods = artifact_periods or []
+
+    cardiac_samples = int(fs / dominant_freq)
+    min_samples     = int(2 * cardiac_samples)
+    max_gap         = int(6 * cardiac_samples)
+
+    # Exclude artefact regions from baseline computation
+    artifact_mask = _build_artifact_mask(len(signal), artifact_periods)
+    clean_peaks   = peaks[~artifact_mask[peaks]] if len(peaks) > 0 else peaks
+    avg_peak_height = float(np.mean(signal[clean_peaks])) if len(clean_peaks) > 0 \
+                      else float(np.nanmean(signal))
+
+    # ------------------------------------------------------------------
+    # Criterion 1 — Short inter-peak intervals
+    # ------------------------------------------------------------------
+    short_min_dist = max(int(cardiac_samples * 0.15), 5)
+    thresh_iv      = cardiac_samples * 0.55
+    min_height     = avg_peak_height * 0.25
+
+    all_peaks, _ = find_peaks(signal, distance=short_min_dist,
+                              prominence=max(5.0, min_height * 0.1))
+
+    # Both peaks in a short-interval pair must individually exceed 65 % of the
+    # average systolic height.  This excludes the normal dicrotic wave (which
+    # sits at ~50-56 % of systolic) from being flagged as ringing.
+    ringing_height = avg_peak_height * 0.65
+
+    short_iv_mask = np.zeros(len(signal), dtype=bool)
+    if len(all_peaks) >= 2:
+        ivs = np.diff(all_peaks)
+        for i, iv in enumerate(ivs):
+            p1, p2 = all_peaks[i], all_peaks[i + 1]
+            if (iv < thresh_iv
+                    and signal[p1] > ringing_height
+                    and signal[p2] > ringing_height):
+                # Flag a full cardiac interval on each side so that nearby
+                # events merge into a contiguous slinger period via max_gap.
+                s_start = max(0, p1 - cardiac_samples)
+                s_end   = min(len(signal), p2 + cardiac_samples)
+                short_iv_mask[s_start:s_end] = True
+
+    # ------------------------------------------------------------------
+    # Criterion 2 — Tall peaks (burst ringing)
+    # ------------------------------------------------------------------
+    tall_thresh = avg_peak_height * 1.5
+
+    tall_mask = np.zeros(len(signal), dtype=bool)
+    for p in all_peaks:
+        if signal[p] > tall_thresh:
+            # Flag one full cardiac interval on each side so that a single
+            # tall peak generates a region long enough to meet min_samples.
+            s_start = max(0, p - cardiac_samples)
+            s_end   = min(len(signal), p + cardiac_samples)
+            tall_mask[s_start:s_end] = True
+
+    # ------------------------------------------------------------------
+    # Criterion 3 — Spectral ringing power
+    # ------------------------------------------------------------------
+    win_samples  = max(int(1.0 * fs), 32)
+    overlap      = int(win_samples * 0.75)
+    spec_freqs, spec_times, Sxx = spectrogram(
+        signal, fs, nperseg=win_samples, noverlap=overlap, nfft=win_samples)
+
+    ringing_low  = 2.0 * dominant_freq
+    total_band   = (spec_freqs >= 0.5)  & (spec_freqs <= 15.0)
+    ringing_band = (spec_freqs >= ringing_low) & (spec_freqs <= 15.0)
+
+    total_power   = Sxx[total_band].sum(axis=0)
+    ringing_power = Sxx[ringing_band].sum(axis=0)
+    spec_ringing_frac = ringing_power / (total_power + 1e-10)
+
+    # Adaptive threshold: use signal's own spectral baseline so that
+    # signals with naturally high harmonic content (e.g., strong dicrotic
+    # waves at high HR) don't produce false positives.
+    spec_threshold = max(0.75, float(np.median(spec_ringing_frac))
+                         + 3.0 * float(np.std(spec_ringing_frac)))
+
+    spec_mask = np.zeros(len(signal), dtype=bool)
+    half_win_spec = win_samples // 2
+    for i, ts in enumerate(spec_times):
+        if spec_ringing_frac[i] > spec_threshold:
+            s_start = max(0, int(ts * fs) - half_win_spec)
+            s_end   = min(len(signal), int(ts * fs) + half_win_spec)
+            spec_mask[s_start:s_end] = True
+
+    # ------------------------------------------------------------------
+    # Combine criteria and exclude known artefact periods
+    # ------------------------------------------------------------------
+    combined_mask                = short_iv_mask | tall_mask | spec_mask
+    combined_mask[artifact_mask] = False
+
+    slinger_periods = _merge_periods(
+        _find_periods(combined_mask, min_samples), max_gap)
+
+    return slinger_periods, avg_peak_height, spec_times, spec_ringing_frac

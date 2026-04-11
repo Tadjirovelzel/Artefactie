@@ -1,7 +1,12 @@
 {
   "permissions": {
     "allow": [
-      "Bash(py readArtefacts.py)"
+      "Bash(py readArtefacts.py)",
+      "Bash(/c/Users/tvelzel/AppData/Local/Programs/Python/Python311/python.exe -c ':*)",
+      "Read(//usr/**)",
+      "Read(//usr/local/**)",
+      "Bash(cmd /c \"where python\")",
+      "Bash(C:/Users/tvelzel/AppData/Local/Programs/Python/Python311/python.exe -c ':*)"
     ]
   }
 }

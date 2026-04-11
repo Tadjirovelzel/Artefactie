@@ -29,6 +29,7 @@ from detectie import (
     detect_infuus_cvp,
     redetect_peaks_clean,
     detect_gasbubble,
+    detect_slinger,
 )
 
 # ---------------------------------------------------------------------------
@@ -88,13 +89,13 @@ def read_artefacts(filepath, fs):
 # ---------------------------------------------------------------------------
 
 def shade_artifacts(ax, t, flush_periods, cal_periods, gasbubble_periods,
-                    infuus_periods=None):
+                    infuus_periods=None, slinger_periods=None):
     """
     Shade artefact periods on a time-series axis.
 
     Flush artefacts are shaded red, calibration artefacts blue, gas-bubble
-    artefacts green, and infuus artefacts purple. Duplicate legend entries
-    are automatically removed.
+    artefacts green, infuus artefacts purple, and slinger artefacts orange.
+    Duplicate legend entries are automatically removed.
 
     Parameters
     ----------
@@ -104,8 +105,10 @@ def shade_artifacts(ax, t, flush_periods, cal_periods, gasbubble_periods,
     cal_periods       : list of (start_idx, end_idx) tuples
     gasbubble_periods : list of (start_idx, end_idx) tuples
     infuus_periods    : list of (start_idx, end_idx) tuples  (optional)
+    slinger_periods   : list of (start_idx, end_idx) tuples  (optional)
     """
-    infuus_periods = infuus_periods or []
+    infuus_periods  = infuus_periods  or []
+    slinger_periods = slinger_periods or []
 
     for s, e in flush_periods:
         ax.axvspan(t[s], t[min(e, len(t) - 1)], color="red",    alpha=0.2, label="Flush type artifact")
@@ -115,6 +118,8 @@ def shade_artifacts(ax, t, flush_periods, cal_periods, gasbubble_periods,
         ax.axvspan(t[s], t[min(e, len(t) - 1)], color="green",  alpha=0.2, label="Gasbubble artifact")
     for s, e in infuus_periods:
         ax.axvspan(t[s], t[min(e, len(t) - 1)], color="purple", alpha=0.2, label="Infuus artifact")
+    for s, e in slinger_periods:
+        ax.axvspan(t[s], t[min(e, len(t) - 1)], color="orange", alpha=0.3, label="Slinger artifact")
 
     handles, labels = ax.get_legend_handles_labels()
     unique = {}
@@ -159,7 +164,10 @@ def plot_results(t, ABP, CVP, results, folder, filename):
                label=f"Avg systolic ({results['abp_avg_sys']:.1f} mmHg)")
     ax.axhline(results["abp_avg_dia"],   color="darkgreen", linestyle=":", linewidth=0.8,
                label=f"Avg diastolic ({results['abp_avg_dia']:.1f} mmHg)")
-    shade_artifacts(ax, t, results["abp_flush"], results["abp_cal"], results["abp_gasbubble"])
+    shade_artifacts(ax, t, results["abp_flush"], results["abp_cal"], results["abp_gasbubble"],
+                    slinger_periods=results["abp_slinger"])
+    ax.axhline(results["abp_slinger_thr"], color="orange", linestyle=":", linewidth=0.8,
+               label=f"Slinger threshold ({results['abp_slinger_thr']:.1f} mmHg)")
     ax.set_title("Arterial Blood Pressure (ABP)")
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("ABP (mmHg)")
@@ -173,7 +181,10 @@ def plot_results(t, ABP, CVP, results, folder, filename):
     ax.axhline(results["cvp_flush_thr"], color="red", linestyle=":", linewidth=0.8,
                label=f"Flush threshold ({results['cvp_flush_thr']:.1f} mmHg)")
     shade_artifacts(ax, t, results["cvp_flush"], [], [],
-                    infuus_periods=results["cvp_infuus"])
+                    infuus_periods=results["cvp_infuus"],
+                    slinger_periods=results["cvp_slinger"])
+    ax.axhline(results["cvp_slinger_thr"], color="orange", linestyle=":", linewidth=0.8,
+               label=f"Slinger threshold ({results['cvp_slinger_thr']:.1f} mmHg)")
     ax.set_title("Central Venous Pressure (CVP)")
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("CVP (mmHg)")
@@ -199,7 +210,7 @@ def plot_results(t, ABP, CVP, results, folder, filename):
     ax.set_ylabel("Magnitude (mmHg)")
     ax.legend()
 
-    # --- Row 3: Spectrograms ---
+    # --- Row 3: Spectrograms with slinger ringing-fraction overlay ---
     abp_freqs, abp_times, abp_Sxx = spectrogram(
         ABP, FS, nperseg=int(RESOLUTION * FS), noverlap=0, nfft=int(FS * RESOLUTION))
     cvp_freqs, cvp_times, cvp_Sxx = spectrogram(
@@ -208,6 +219,17 @@ def plot_results(t, ABP, CVP, results, folder, filename):
     im_abp = axes[2, 0].pcolormesh(abp_times, abp_freqs, 10 * np.log10(abp_Sxx),
                                     shading="auto", cmap="viridis")
     axes[2, 0].set_ylim(FRANGE)
+    # Shade slinger periods on spectrogram
+    for s, e in results["abp_slinger"]:
+        axes[2, 0].axvspan(t[s], t[min(e, len(t) - 1)], color="orange", alpha=0.35,
+                           label="Slinger artifact")
+    # Twin axis: ringing fraction curve
+    ax2 = axes[2, 0].twinx()
+    ax2.plot(results["abp_spec_times"], results["abp_spec_rf"],
+             color="orange", linewidth=1.0, alpha=0.8, label="Ringing fraction")
+    ax2.set_ylabel("Ringing fraction", color="orange", fontsize=8)
+    ax2.tick_params(axis="y", labelcolor="orange", labelsize=7)
+    ax2.set_ylim(0, 1)
     axes[2, 0].set_title("ABP Spectrogram")
     axes[2, 0].set_xlabel("Time (s)")
     axes[2, 0].set_ylabel("Frequency (Hz)")
@@ -216,6 +238,15 @@ def plot_results(t, ABP, CVP, results, folder, filename):
     im_cvp = axes[2, 1].pcolormesh(cvp_times, cvp_freqs, 10 * np.log10(cvp_Sxx),
                                     shading="auto", cmap="viridis")
     axes[2, 1].set_ylim(FRANGE)
+    for s, e in results["cvp_slinger"]:
+        axes[2, 1].axvspan(t[s], t[min(e, len(t) - 1)], color="orange", alpha=0.35,
+                           label="Slinger artifact")
+    ax3 = axes[2, 1].twinx()
+    ax3.plot(results["cvp_spec_times"], results["cvp_spec_rf"],
+             color="orange", linewidth=1.0, alpha=0.8, label="Ringing fraction")
+    ax3.set_ylabel("Ringing fraction", color="orange", fontsize=8)
+    ax3.tick_params(axis="y", labelcolor="orange", labelsize=7)
+    ax3.set_ylim(0, 1)
     axes[2, 1].set_title("CVP Spectrogram")
     axes[2, 1].set_xlabel("Time (s)")
     axes[2, 1].set_ylabel("Frequency (Hz)")
@@ -241,7 +272,8 @@ def run_pipeline(filepath):
     4. Detect flush and calibration artefacts (ABP only for calibration).
     5. Re-detect peaks on clean signal sections only.
     6. Detect gas-bubble artefacts using clean peaks.
-    7. Plot all results.
+    7. Detect slinger (resonance/ringing) artefacts for ABP and CVP.
+    8. Plot all results.
 
     Parameters
     ----------
@@ -293,7 +325,21 @@ def run_pipeline(filepath):
         ABP, FS, abp_dominant_freq, abp_peaks, artifact_periods=abp_flush + abp_cal)
     print(f"ABP — {len(abp_gasbubble)} gasbubble artefact(s)")
 
-    # Step 7 — Plot
+    # Step 7 — Slinger detection (ABP and CVP)
+    # Calibration periods (signal ~0 mmHg) are excluded so their flat
+    # baseline does not distort the slinger amplitude threshold; flush and
+    # gas-bubble periods are intentionally NOT excluded because a slinger
+    # artefact may be superimposed on or immediately follow a flush event.
+    abp_slinger, abp_slinger_thr, abp_spec_times, abp_spec_rf = detect_slinger(
+        ABP, FS, abp_dominant_freq, abp_peaks, artifact_periods=abp_cal)
+
+    cvp_slinger, cvp_slinger_thr, cvp_spec_times, cvp_spec_rf = detect_slinger(
+        CVP, FS, cvp_dominant_freq, cvp_peaks, artifact_periods=[])
+
+    print(f"ABP — {len(abp_slinger)} slinger artefact(s)")
+    print(f"CVP — {len(cvp_slinger)} slinger artefact(s)")
+
+    # Step 8 — Plot
     results = dict(
         abp_peaks=abp_peaks,         cvp_peaks=cvp_peaks,
         abp_dominant_freq=abp_dominant_freq, cvp_dominant_freq=cvp_dominant_freq,
@@ -305,6 +351,10 @@ def run_pipeline(filepath):
         cvp_infuus=cvp_infuus,       cvp_hp=cvp_hp,
         abp_gasbubble=abp_gasbubble,
         abp_avg_sys=abp_avg_sys,     abp_avg_dia=abp_avg_dia,
+        abp_slinger=abp_slinger,     cvp_slinger=cvp_slinger,
+        abp_slinger_thr=abp_slinger_thr, cvp_slinger_thr=cvp_slinger_thr,
+        abp_spec_times=abp_spec_times,   abp_spec_rf=abp_spec_rf,
+        cvp_spec_times=cvp_spec_times,   cvp_spec_rf=cvp_spec_rf,
     )
     plot_results(t, ABP, CVP, results, folder, filename)
 
