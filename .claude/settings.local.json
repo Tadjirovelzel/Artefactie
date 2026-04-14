@@ -41,7 +41,8 @@
       "Bash(node -e \"console.log\\('Node available'\\)\")",
       "Bash(unzip -l \"h:\\\\school\\\\Artefactie\\\\data\\\\KT3401_AFdata_2025\\\\Slinger\\\\D01Slinger.xlsx\")",
       "Bash(7z l:*)",
-      "Bash(unzip -q \"h:\\\\school\\\\Artefactie\\\\data\\\\KT3401_AFdata_2025\\\\Slinger\\\\D01Slinger.xlsx\")"
+      "Bash(unzip -q \"h:\\\\school\\\\Artefactie\\\\data\\\\KT3401_AFdata_2025\\\\Slinger\\\\D01Slinger.xlsx\")",
+      "Bash(grep -v \"^\\\\s*$\")"
     ]
   }
 }

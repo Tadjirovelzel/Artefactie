@@ -85,7 +85,8 @@ artefacts = {
     "flush_abp"  : [],
     "cal_cvp"    : [],
     "flush_cvp"  : [],
-    "slinger"    : [],
+    "slinger_abp": [],
+    "slinger_cvp": [],
     "gasbubble"  : [],
     "transducer" : [],
     "infuus"     : [],
@@ -122,13 +123,23 @@ while True:
     # Every step below calls _register_first; if it returns True the step found
     # something and the outer loop continues immediately.
     def _register_first(key, periods):
-        """Register only the earliest-starting period.  Return True if found."""
+        """Register only the earliest-starting non-overlapping period.
+
+        Periods that overlap with already-excluded samples are skipped so it is
+        structurally impossible for any registered period to overlap with a
+        previously registered one, regardless of what a detector returned.
+        """
         if not periods:
             return False
-        first = min(periods, key=lambda p: p[0])
+        excl_now = build_exclusion_mask()
+        non_overlapping = [p for p in periods if not excl_now[p[0]:p[1]].any()]
+        if not non_overlapping:
+            return False
+        first = min(non_overlapping, key=lambda p: p[0])
         register(key, [first])
         print(f"  {key:12s}: registered  {first[0]/fs:.1f}–{first[1]/fs:.1f} s"
-              f"  (detector found {len(periods)} total, using earliest)")
+              f"  (detector found {len(periods)} total, "
+              f"{len(non_overlapping)} non-overlapping, using earliest)")
         return True
 
     # ── step 1 ───────────────────────────────────────────────────────────────
@@ -172,9 +183,11 @@ while True:
     # Compute ringing_ratio = P_high / P_total where P_high is power above
     # 2 × dominant cardiac frequency.  A spike in ringing_ratio that exceeds
     # the signal's own baseline by K_THRESH × IQR indicates resonance.
+    # ABP and CVP are detected independently; across both lists only the
+    # earliest-starting non-overlapping period is registered per iteration.
     excl = build_exclusion_mask()
     try:
-        slinger_periods = detect_slinger(
+        slinger_abp_periods, slinger_cvp_periods = detect_slinger(
             abp, cvp, fs,
             excluded=excl,
             lp_cutoff=LP_CUTOFF,
@@ -182,7 +195,20 @@ while True:
             spec_fmax=SPEC_FMAX,
             k=K_THRESH,
         )
-        _register_first("slinger", slinger_periods)
+        candidates = (
+            [("slinger_abp", p) for p in slinger_abp_periods] +
+            [("slinger_cvp", p) for p in slinger_cvp_periods]
+        )
+        if candidates:
+            excl_now = build_exclusion_mask()
+            non_overlapping = [(key, p) for key, p in candidates
+                               if not excl_now[p[0]:p[1]].any()]
+            if non_overlapping:
+                key, first = min(non_overlapping, key=lambda x: x[1][0])
+                register(key, [first])
+                print(f"  {key:12s}: registered  {first[0]/fs:.1f}-{first[1]/fs:.1f} s"
+                      f"  (detector found {len(candidates)} total, "
+                      f"{len(non_overlapping)} non-overlapping, using earliest)")
     except NotImplementedError:
         print("  slinger     : not implemented — skipping")
 
@@ -281,7 +307,8 @@ ARTEFACT_COLOURS = {
     "flush_abp"  : "#ff7f0e",   # orange
     "cal_cvp"    : "#17becf",   # teal
     "flush_cvp"  : "#ffbb78",   # light orange
-    "slinger"    : "#d62728",   # red
+    "slinger_abp": "#d62728",   # red
+    "slinger_cvp": "#e57373",   # light red
     "gasbubble"  : "#2ca02c",   # green
     "transducer" : "#9467bd",   # purple
     "infuus"     : "#8c564b",   # brown
@@ -292,7 +319,8 @@ ARTEFACT_AXES = {
     "flush_abp"  : ("abp",),
     "cal_cvp"    : ("cvp",),
     "flush_cvp"  : ("cvp",),
-    "slinger"    : ("abp", "cvp"),
+    "slinger_abp": ("abp",),
+    "slinger_cvp": ("cvp",),
     "gasbubble"  : ("abp", "cvp"),
     "transducer" : ("abp", "cvp"),
     "infuus"     : ("cvp",),
