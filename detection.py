@@ -17,239 +17,187 @@ from signal_helpers import lowpass, highpass, rolling_std
 # ── step 1 ─────────────────────────────────────────────────────────────────────
 
 def detect_calibration_flush(abp, cvp, fs, excluded,
-                              lp_cutoff, hp_cutoff, spec_fmax, k,
-                              # ── sensitivity / bound parameters ────────────
-                              flush_offset=15.0,
-                              min_event_s=2.0,
-                              lp_boundary_hz=0.5,
-                              spec_overlap=0.75,
-                              cal_lp_ratio=0.5,
-                              flush_hp_lo=0.3,
-                              flush_hp_hi=2.0):
+                              lp_cutoff, hp_cutoff=None, spec_fmax=None, k=None,
+                              # ── sensitivity parameters ────────────────────
+                              cal_threshold=0.2,
+                              flush_threshold=2.0,
+                              cardiac_fmin=0.5,
+                              cardiac_fmax=3.0,
+                              min_flush_s=1.0,
+                              # ── physiological ranges ──────────────────────
+                              abp_phys=(30, 160),
+                              cvp_phys=(3,  20),
+                              # ── per-channel scan masks ────────────────────
+                              excluded_abp=None,
+                              excluded_cvp=None):
     """
     Detect calibration and flush periods, separately per channel.
 
-    Two detection paths are combined:
-      Path A — spectrogram collapse → LP below baseline  →  calibration
-                                    → LP above baseline  →  flush (flat type)
-      Path B — LP spike alone (> baseline + flush_offset mmHg, ≥ min_event_s)
-                                                         →  flush (oscillating type)
-    Path B catches flushes where the signal never goes quiet (e.g. turbulent
-    CVP flush with large oscillations) that Path A would miss entirely.
+    Calibration : raw signal < cal_threshold   × LP mean  for ≥ 2 cardiac periods.
+    Flush       : raw signal > flush_threshold × LP mean  for ≥ 2 cardiac periods.
+
+    The LP mean is computed only from samples whose LP value falls within the
+    physiological range for that channel (abp_phys or cvp_phys), so artefact
+    periods do not bias the baseline.
+
+    Both detectors run independently on ABP and CVP.
 
     Parameters
     ----------
     abp, cvp         : 1D float arrays
     fs               : sample rate (Hz)
     excluded         : bool array, True = already excluded
-    lp_cutoff        : low-pass cutoff (Hz) for cal-vs-flush classification
-    hp_cutoff        : high-pass cutoff (Hz) for oscillation amplitude check
-    spec_fmax        : upper frequency limit for P_total computation (Hz)
-    k                : collapse threshold — collapsed if P_total < p75 / k²
-    flush_offset     : mmHg above baseline LP needed to call a Path-B flush spike
-    min_event_s      : minimum accepted event duration (s)
-    lp_boundary_hz   : cutoff (Hz) for the fast LP used in boundary refinement
-    spec_overlap     : fractional overlap between successive spectrogram windows
-    cal_lp_ratio     : LP must be below this fraction of baseline to call calibration
-                       (vs gas-bubble); 0.5 means LP < 50 % of baseline
-    flush_hp_lo      : HP-std lower bound (× baseline) for Path-B flush acceptance;
-                       ratios below this are "flat" (oscillations suppressed) → flush
-    flush_hp_hi      : HP-std upper bound (× baseline) for Path-B flush acceptance;
-                       ratios above this are "turbulent" → flush.
-                       Ratios inside [flush_hp_lo, flush_hp_hi] are "normal cardiac"
-                       amplitude → infuus, not flush.
+    lp_cutoff        : low-pass cutoff (Hz) for baseline estimation
+    cal_threshold   : threshold as a fraction of LP mean (default 0.2);
+                      calibration starts when raw drops below this and stays
+                      below for ≥ 1 cardiac period; ends when raw rises back
+                      above this and stays above for ≥ 1 cardiac period
+    flush_threshold : raw must rise above this multiple of LP mean (default 2.0)
+    min_flush_s        : minimum flush duration in seconds (default 1.0); kept
+                         separate from cal because flush can be a brief injection
+    cardiac_fmin/max : frequency band (Hz) for dominant cardiac frequency search
+    abp_phys         : (lo, hi) physiological range for ABP in mmHg (default 30–160)
+    cvp_phys         : (lo, hi) physiological range for CVP in mmHg (default 3–20)
 
     Returns
     -------
     cal_abp, flush_abp, cal_cvp, flush_cvp : four lists of (start, end) tuples
     """
-    n             = len(abp)
-    window_s      = 2.0
-    nperseg       = max(int(window_s * fs), 32)
-    noverlap      = int(nperseg * spec_overlap)
-    min_samples   = max(int(min_event_s * fs), 1)
-    clean_samples = ~excluded
+    # Full exclusion mask — used for LP mean and cardiac period so that
+    # previously detected artefacts do not bias the baselines.
+    clean = ~excluded
 
-    # Zero-phase LP for boundary detection
-    nyq  = 0.5 * fs
-    b, a = butter(2, max(lp_boundary_hz / nyq, 1e-3), btype="low")
+    # Per-channel scan masks — used only for the entry trigger so that an ABP
+    # artefact does not prevent CVP calibration from being detected in the same
+    # time window (and vice-versa).  Defaults to the full mask when not supplied.
+    scan_abp = ~excluded_abp if excluded_abp is not None else clean
+    scan_cvp = ~excluded_cvp if excluded_cvp is not None else clean
 
-    def _detect_one(signal, ch_name):
-        print(f"    [{ch_name}] running cal/flush detection")
-
-        lp_fast = filtfilt(b, a, signal)
-        lp_slow = lowpass(signal, fs, cutoff_hz=lp_cutoff)
-
-        def _med(arr):
-            return np.median(arr[clean_samples]) if clean_samples.any() else np.median(arr)
-
-        lp_fast_norm = _med(lp_fast)
-        lp_slow_norm = _med(lp_slow)
-        print(f"    [{ch_name}] LP baseline: {lp_fast_norm:.1f} mmHg  "
-              f"LP slow baseline: {lp_slow_norm:.1f} mmHg")
-
-        hp_sig      = highpass(signal, fs, cutoff_hz=hp_cutoff)
-        hp_std      = rolling_std(hp_sig, fs, window_s=1.0)
-        valid       = clean_samples & ~np.isnan(hp_std)
-        hp_std_norm = (np.median(hp_std[valid]) if valid.any()
-                       else np.median(hp_std[~np.isnan(hp_std)]))
-        print(f"    [{ch_name}] HP-std baseline: {hp_std_norm:.2f} mmHg")
-
-        def _lp_boundaries(s_rough, e_rough, is_flush):
-            extend = int(window_s * fs)
-            s_srch = max(0, s_rough - extend)
-            e_srch = min(n, e_rough + extend)
-            seg    = lp_fast[s_srch:e_srch]
-            if len(seg) < 4:
-                return s_rough, e_rough
-            deriv = np.gradient(seg)
-            r_e   = e_rough - s_srch
-            if is_flush:
-                sub = deriv[:r_e]
-                if sub.size == 0: return s_rough, e_rough
-                start_off = int(np.argmax(sub))
-                sub2 = deriv[start_off:]
-                if sub2.size == 0: return s_rough, e_rough
-                end_off = start_off + int(np.argmin(sub2))
-            else:
-                sub = deriv[:r_e]
-                if sub.size == 0: return s_rough, e_rough
-                start_off = int(np.argmin(sub))
-                sub2 = deriv[start_off:]
-                if sub2.size == 0: return s_rough, e_rough
-                end_off = start_off + int(np.argmax(sub2))
-            if start_off >= end_off:
-                return s_rough, e_rough
-            return s_srch + start_off, s_srch + end_off + 1
-
-        # ── Path A: spectrogram collapse ──────────────────────────────────────
-        print(f"    [{ch_name}] Path A: computing spectrogram (window {window_s} s)")
-        freqs, times, Sxx = _spectrogram(
-            signal, fs=fs, nperseg=nperseg, noverlap=noverlap,
-            nfft=nperseg, scaling="density",
-        )
-        band    = (freqs >= 0.5) & (freqs <= spec_fmax)
-        P_total = Sxx[band, :].sum(axis=0)
-
-        half_win = nperseg // 2
-        def _ef(ti):
-            s = max(0, int(ti * fs) - half_win)
-            e = min(n, int(ti * fs) + half_win)
-            return excluded[s:e].mean() if e > s else 1.0
-
-        clean_win = np.array([_ef(ti) for ti in times]) < 0.5
-        cal_p   = []
-        flush_a = []
-
-        if clean_win.sum() >= 4:
-            p75          = np.percentile(P_total[clean_win], 75)
-            collapse_thr = p75 / (k ** 2)
-            collapsed    = (P_total < collapse_thr) & clean_win
-            print(f"    [{ch_name}] Path A: P_total p75={p75:.2e}  "
-                  f"collapse threshold={collapse_thr:.2e}  "
-                  f"collapsed windows={collapsed.sum()}")
-
-            i = 0
-            while i < len(times):
-                if collapsed[i]:
-                    j = i + 1
-                    while j < len(times) and collapsed[j]:
-                        j += 1
-
-                    s_rough = max(0, int((times[i]     - window_s / 2) * fs))
-                    e_rough = min(n, int((times[j - 1] + window_s / 2) * fs))
-
-                    lp_mean = lp_slow[s_rough:e_rough].mean()
-                    if lp_mean > lp_slow_norm:
-                        is_flush = True
-                    elif lp_mean < lp_slow_norm * cal_lp_ratio:
-                        is_flush = False
-                    else:
-                        print(f"    [{ch_name}] Path A: LP near baseline "
-                              f"({lp_mean:.1f} vs {lp_slow_norm:.1f} mmHg) "
-                              f"— not cal/flush, skipping (gas bubble?)")
-                        i = j
-                        continue
-
-                    s_final, e_final = _lp_boundaries(s_rough, e_rough, is_flush)
-                    kind = "flush" if is_flush else "cal"
-
-                    if e_final - s_final < min_samples:
-                        print(f"    [{ch_name}] Path A: {kind} too short "
-                              f"({(e_final - s_final) / fs:.2f} s) — skipped")
-                        i = j
-                        continue
-
-                    print(f"    [{ch_name}] Path A: {kind} period  "
-                          f"{s_final/fs:.1f}–{e_final/fs:.1f} s")
-                    (flush_a if is_flush else cal_p).append((s_final, e_final))
-                    i = j
-                else:
-                    i += 1
-        else:
-            print(f"    [{ch_name}] Path A: not enough clean windows — skipped")
-
-        # ── Path B: LP spike → oscillating flush ─────────────────────────────
-        print(f"    [{ch_name}] Path B: LP spike scan  "
-              f"(threshold = baseline + {flush_offset} mmHg = "
-              f"{lp_slow_norm + flush_offset:.1f} mmHg)")
-        flush_thr       = lp_slow_norm + flush_offset
-        above           = lp_slow > flush_thr
-        above[excluded] = False
-
-        flush_b = []
+    def _find_runs(mask, min_samples):
+        """Return list of (start, end) for contiguous True runs ≥ min_samples."""
+        periods = []
         i = 0
-        while i < n:
-            if above[i]:
+        while i < len(mask):
+            if mask[i]:
                 j = i + 1
-                while j < n and above[j]:
+                while j < len(mask) and mask[j]:
                     j += 1
                 if j - i >= min_samples:
-                    s_f, e_f = _lp_boundaries(i, j, is_flush=True)
-                    seg = hp_std[s_f:e_f]
-                    seg = seg[~np.isnan(seg)]
-                    if seg.size > 0:
-                        ratio = seg.mean() / hp_std_norm if hp_std_norm > 0 else 0.0
-                        if flush_hp_lo <= ratio <= flush_hp_hi:
-                            print(f"    [{ch_name}] Path B: LP spike but oscillations "
-                                  f"at normal amplitude (HP std {seg.mean():.2f}, "
-                                  f"{ratio:.2f}× baseline {hp_std_norm:.2f}) "
-                                  f"— not flush (infuus?)")
-                            i = j
-                            continue
-                        else:
-                            print(f"    [{ch_name}] Path B: flush confirmed — "
-                                  f"oscillations {'flat' if ratio < flush_hp_lo else 'turbulent'} "
-                                  f"(HP std {seg.mean():.2f}, {ratio:.2f}× baseline "
-                                  f"{hp_std_norm:.2f})")
-                    flush_b.append((s_f, e_f))
-                    print(f"    [{ch_name}] Path B: flush period  "
-                          f"{s_f/fs:.1f}–{e_f/fs:.1f} s")
-                else:
-                    print(f"    [{ch_name}] Path B: spike at {i/fs:.1f} s too short "
-                          f"({(j - i)/fs:.2f} s) — ignored")
+                    periods.append((i, j))
                 i = j
             else:
                 i += 1
+        return periods
 
-        def _merge(periods):
-            if not periods:
-                return []
-            srt = sorted(periods)
-            merged = [list(srt[0])]
-            for s, e in srt[1:]:
-                if s <= merged[-1][1]:
-                    merged[-1][1] = max(merged[-1][1], e)
+    def _cardiac_period(signal):
+        """Estimate dominant cardiac period (s) from the FFT of clean samples."""
+        clean_sig = signal[clean]
+        if len(clean_sig) < int(2 * fs):
+            return 1.0
+        fft_mag = np.abs(np.fft.rfft(clean_sig - clean_sig.mean()))
+        freqs   = np.fft.rfftfreq(len(clean_sig), 1.0 / fs)
+        band    = (freqs >= cardiac_fmin) & (freqs <= cardiac_fmax)
+        if not band.any():
+            return 1.0
+        f_dom = freqs[band][np.argmax(fft_mag[band])]
+        return 1.0 / max(f_dom, 1e-3)
+
+    def _detect_one(signal, ch_name, phys_lo, phys_hi, scan_clean):
+        lp           = lowpass(signal, fs, cutoff_hz=lp_cutoff)
+        phys_mask    = clean & (lp >= phys_lo) & (lp <= phys_hi)
+        if phys_mask.any():
+            lp_mean = np.mean(lp[phys_mask])
+        else:
+            lp_mean = np.mean(lp[clean]) if clean.any() else np.mean(lp)
+            print(f"    [{ch_name}] warning: no samples in physiological range "
+                  f"({phys_lo}–{phys_hi} mmHg), falling back to full clean mean")
+
+        period_s       = _cardiac_period(signal)
+        window         = max(int(period_s * fs), 1)   # 1 cardiac period in samples
+        min_flush_samp = max(int(min_flush_s * fs), 1)
+
+        print(f"    [{ch_name}] LP mean={lp_mean:.1f} mmHg  "
+              f"(from {phys_mask.sum()} physio samples)  "
+              f"cardiac period={period_s:.2f} s  "
+              f"cal thr={cal_threshold * lp_mean:.1f}  "
+              f"flush thr={flush_threshold * lp_mean:.1f} mmHg")
+
+        # ── calibration ───────────────────────────────────────────────────────
+        # Entry : a sample drops below cal_thr AND the mean of the raw signal
+        #         over the next cardiac period is also below cal_thr.
+        # Exit  : a sample rises above cal_thr AND the mean of the raw signal
+        #         over the next cardiac period is also above cal_thr.
+        # Any above-threshold trigger whose window mean does not confirm is
+        # treated as a transient: the scanner skips past the above-threshold
+        # section and resumes inside the calibration period.
+        cal_thr = cal_threshold * lp_mean
+
+        def _win_mean(start_idx):
+            end = min(start_idx + window, n)
+            return np.mean(signal[start_idx:end])
+
+        print(f"    [{ch_name}] signal range: {signal[scan_clean].min():.2f}–{signal[scan_clean].max():.2f} mmHg "
+              f"(scan samples)  cal_thr={cal_thr:.3f}  window={window} smp ({window/fs:.2f}s)")
+
+        cal_periods = []
+        i = 0
+        n = len(signal)
+        _entry_misses = 0   # count unconfirmed entries for diagnostics
+        while i < n:
+            # Entry trigger: sample below threshold (uses per-channel scan mask so
+            # an artefact on the other channel does not block detection here)
+            if signal[i] < cal_thr and scan_clean[i]:
+                wm_entry = _win_mean(i)
+                # Confirm with window mean
+                if wm_entry < cal_thr:
+                    start = i
+                    print(f"    [{ch_name}] cal ENTRY confirmed  t={i/fs:.2f}s  "
+                          f"signal={signal[i]:.3f}  win_mean={wm_entry:.3f}  cal_thr={cal_thr:.3f}")
+                    j = i + 1
+                    while j < n:
+                        # Exit trigger: sample rises above threshold
+                        if signal[j] >= cal_thr:
+                            wm_exit = _win_mean(j)
+                            # Confirm with window mean
+                            if wm_exit >= cal_thr:
+                                print(f"    [{ch_name}] cal EXIT  confirmed  t={j/fs:.2f}s  "
+                                      f"signal={signal[j]:.3f}  win_mean={wm_exit:.3f}")
+                                cal_periods.append((start, j))
+                                i = j
+                                break
+                            # Not confirmed — transient spike; skip to where
+                            # signal drops back below threshold
+                            k = j + 1
+                            while k < n and signal[k] >= cal_thr:
+                                k += 1
+                            j = k
+                        else:
+                            j += 1
+                    else:
+                        # Never found a confirmed exit — signal still low at end
+                        print(f"    [{ch_name}] cal EXIT  at end-of-signal  start={start/fs:.2f}s")
+                        cal_periods.append((start, n))
+                        i = n
                 else:
-                    merged.append([s, e])
-            return [tuple(p) for p in merged]
+                    if _entry_misses < 5:
+                        print(f"    [{ch_name}] cal entry MISS      t={i/fs:.2f}s  "
+                              f"signal={signal[i]:.3f}  win_mean={wm_entry:.3f}  cal_thr={cal_thr:.3f}")
+                    _entry_misses += 1
+                    i += 1   # window mean not confirmed, advance
+            else:
+                i += 1
+        if _entry_misses > 5:
+            print(f"    [{ch_name}] ... ({_entry_misses} entry triggers did not confirm)")
+        print(f"    [{ch_name}] cal: {len(cal_periods)} period(s)")
 
-        flush_p = _merge(flush_a + flush_b)
-        print(f"    [{ch_name}] result: {len(cal_p)} cal, {len(flush_p)} flush period(s)")
-        return cal_p, flush_p
+        # ── flush: raw above threshold for ≥ min_flush_s ─────────────────────
+        flush_periods = _find_runs((signal > flush_threshold * lp_mean) & scan_clean, min_flush_samp)
+        print(f"    [{ch_name}] flush: {len(flush_periods)} period(s)")
 
-    cal_abp,  flush_abp  = _detect_one(abp, "ABP")
-    cal_cvp,  flush_cvp  = _detect_one(cvp, "CVP")
+        return cal_periods, flush_periods
+
+    cal_abp,  flush_abp  = _detect_one(abp, "ABP", *abp_phys, scan_abp)
+    cal_cvp,  flush_cvp  = _detect_one(cvp, "CVP", *cvp_phys, scan_cvp)
     return cal_abp, flush_abp, cal_cvp, flush_cvp
 
 

@@ -93,12 +93,20 @@ artefacts = {
 }
 
 
-def build_exclusion_mask():
-    """Return a boolean array that is True wherever any artefact was found."""
+def build_exclusion_mask(keys=None):
+    """Return a boolean array that is True wherever any artefact was found.
+
+    Parameters
+    ----------
+    keys : iterable of str, optional
+        If supplied, only the listed artefact keys are included.
+        Defaults to all keys.
+    """
     mask = np.zeros(n, dtype=bool)
-    for periods in artefacts.values():
-        for start, end in periods:
-            mask[start:end] = True
+    for k, periods in artefacts.items():
+        if keys is None or k in keys:
+            for start, end in periods:
+                mask[start:end] = True
     return mask
 
 
@@ -150,6 +158,13 @@ while True:
     # ABP and CVP are detected independently; even so, only one period total
     # is registered per iteration so baselines are always recomputed cleanly.
     excl = build_exclusion_mask()
+    # Per-channel scan masks: each channel only excludes its own previously
+    # detected artefacts plus shared artefacts (gasbubble, transducer, infuus).
+    # This prevents an ABP calibration from masking the CVP calibration detector
+    # when both occur in the same time window (and vice-versa).
+    _shared = ('gasbubble', 'transducer', 'infuus')
+    excl_abp = build_exclusion_mask(('cal_abp', 'flush_abp', 'slinger_abp') + _shared)
+    excl_cvp = build_exclusion_mask(('cal_cvp', 'flush_cvp', 'slinger_cvp') + _shared)
     try:
         cal_abp, flush_abp, cal_cvp, flush_cvp = detect_calibration_flush(
             abp, cvp, fs,
@@ -158,21 +173,23 @@ while True:
             hp_cutoff=HP_CUTOFF,
             spec_fmax=SPEC_FMAX,
             k=K_THRESH,
+            excluded_abp=excl_abp,
+            excluded_cvp=excl_cvp,
         )
-        # Flatten all four result lists, tag each with its registry key, then
-        # register only the single earliest-starting period across all of them.
-        candidates = (
-            [("cal_abp",   p) for p in cal_abp]   +
-            [("flush_abp", p) for p in flush_abp] +
-            [("cal_cvp",   p) for p in cal_cvp]   +
-            [("flush_cvp", p) for p in flush_cvp]
-        )
-        if candidates:
-            key, first = min(candidates, key=lambda x: x[1][0])
-            total = len(candidates)
-            register(key, [first])
-            print(f"  {key:12s}: registered  {first[0]/fs:.1f}–{first[1]/fs:.1f} s"
-                  f"  (detector found {total} total, using earliest)")
+        # ABP and CVP are channel-specific, so register one period per channel
+        # independently — both checked against their own scan mask so a
+        # simultaneous cal on both channels is caught in the same iteration.
+        for ch_candidates, ch_excl in [
+            ([("cal_abp",  p) for p in cal_abp]  + [("flush_abp", p) for p in flush_abp],  excl_abp),
+            ([("cal_cvp",  p) for p in cal_cvp]  + [("flush_cvp", p) for p in flush_cvp],  excl_cvp),
+        ]:
+            non_overlapping = [(k, p) for k, p in ch_candidates
+                               if not ch_excl[p[0]:p[1]].any()]
+            if non_overlapping:
+                key, first = min(non_overlapping, key=lambda x: x[1][0])
+                register(key, [first])
+                print(f"  {key:12s}: registered  {first[0]/fs:.1f}–{first[1]/fs:.1f} s"
+                      f"  ({len(non_overlapping)} non-overlapping, using earliest)")
     except NotImplementedError:
         print("  calibration/flush : not implemented — skipping")
 
