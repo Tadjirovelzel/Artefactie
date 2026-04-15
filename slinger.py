@@ -5,7 +5,7 @@ import numpy as np
 import pandas as pd
 
 base_path = Path(__file__).resolve().parent
-file_path = base_path / "data" / "KT3401_AFdata_2025" / "Slinger"  / "D06Slinger.xlsx"
+file_path = base_path / "data" / "KT3401_AFdata_2025"  / "Infuus_op_CVD/D05Inf-op-CVP_Slinger.xlsx"
 
 print("Bestand:", file_path)
 print("Bestaat:", file_path.exists())
@@ -50,12 +50,14 @@ hf_log = np.log1p(hf_energy)
 baseline_limit = np.percentile(hf_log, 40)
 baseline = hf_log[hf_log <= baseline_limit]
 
+std = np.std(baseline)
+
 med = np.median(baseline)
 mad = np.median(np.abs(baseline - med))
 
 peak = np.max(find_peaks(hf_log, height=baseline_limit)[1]["peak_heights"])
 
-threshold = 0.5 * peak
+threshold = med + 5 * std
 candidate = hf_log > threshold
 
 # -----------------------------
@@ -108,7 +110,7 @@ else:
 plt.figure(figsize=(12, 8))
 
 plt.subplot(3, 1, 1)
-plt.plot(t, abp, label="ABP")
+plt.plot(t, cvp, label="ABP")
 if start_time is not None:
     plt.axvspan(start_time, end_time, alpha=0.3, label="Slinger")
 plt.ylabel("mmHg")
