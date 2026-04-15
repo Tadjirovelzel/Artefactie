@@ -1,37 +1,29 @@
 """
 startagain.py  —  artefact detection decision tree
 
-Decision tree (lazy metric computation):
+Decision tree (iterative/lazy):
 
     START
      │
-     ├─ Compute P_total ──► Oscillations collapsed?
-     │                          YES ──► Compute LP ──► LP near zero?
-     │                                                     YES ──► CALIBRATION
-     │                                                     NO  ──► FLUSH
-     │                          NO ──┐
-     │                               │
-     ├─ Compute ringing_ratio ───────► Ringing above 2×cardiac?
-     │                          YES ──► SLINGER
-     │                          NO ──┐
-     │                               │
-     ├─ Compute HP_env + P_cardiac ──► Beats damped?
-     │                          YES ──► GASBUBBLE
-     │                          NO ──┐
-     │                               │
-     ├─ Compute LP_ABP ──────────────► ABP baseline dropped?
-     │                          YES ──► TRANSDUCER HOOG  (restart)
-     │                          NO ──┐
-     │                               │
-     └─ Compute LP_CVP ──────────────► CVP baseline elevated? (ABP normal?)
-                                YES ──► INFUUS OP CVD
+     ├─ Step 1: Calibration (ABP/CVP) ──► Restart if found
+     │
+     ├─ Step 2: Flush / Infuus (ABP/CVP) ──► Restart if found
+     │
+     ├─ Step 3: Transducer Hoog (ABP) ──► LP dropped? 
+     │                          YES ──► TRANSDUCER HOOG (restart)
+     │                          NO  ──┐
+     │                                │
+     ├─ Step 4: Gasbubbel (ABP) ──────┴──► HP std low & LP stable?
+     │                          YES ──► GASBUBBLE (restart)
+     │                          NO  ──┐
+     │                                │
+     └─ Step 5: Slinger (ABP/CVP) ────► Resonance detected?
+                                YES ──► SLINGER (restart)
                                 NO  ──► END (no new artefacts)
 
 After each detection the flagged period is excluded and the tree restarts
-from the top.  Baselines are always recomputed from the remaining clean signal.
-Transducer hoog is checked before infuus: a dropped ABP would satisfy the
-infuus ABP guard (ABP ≤ threshold) and cause a false positive if both run
-in the same pass.
+from the top. This ensures that a baseline for 'clean signal' is always 
+maintained and that artefacts are not double-counted.
 """
 
 import tkinter as tk
@@ -43,16 +35,16 @@ import matplotlib.patches as mpatches
 
 from signal_helpers import load_signal, lowpass, highpass, compute_spectrogram
 from detection import (
-    detect_calibration_flush,
+    detect_calibration,
+    detect_flush_infuus,
     detect_slinger,
     detect_gasbubble,
     detect_transducer_hoog,
-    detect_infuus,
 )
 
 # ── parameters ────────────────────────────────────────────────────────────────
 LP_CUTOFF = 0.5   # low-pass cutoff used for baseline tracking (Hz)
-HP_CUTOFF = 1.0    # high-pass cutoff used for beat-amplitude tracking (Hz)
+HP_CUTOFF = 1.0    # high-pass cutoff used for beat-amplitude/std tracking (Hz)
 SPEC_FMAX = 15.0   # upper frequency limit for spectrogram features (Hz)
 K_THRESH  = 3.0    # deviation from median in IQR units to call an outlier
 
@@ -74,34 +66,24 @@ n = len(abp)
 
 print(f"File    : {os.path.basename(path)}")
 print(f"Duration: {t[-1]:.1f} s  |  fs: {fs:.0f} Hz  |  {n} samples")
-print(f"ABP     : {abp.min():.0f} – {abp.max():.0f} mmHg")
-print(f"CVP     : {cvp.min():.0f} – {cvp.max():.0f} mmHg")
 
 # ── artefact registry ─────────────────────────────────────────────────────────
-# Calibration and flush are tracked per channel (ABP and CVP can be calibrated
-# independently).  All other artefact types affect both channels together.
 artefacts = {
     "cal_abp"    : [],
     "flush_abp"  : [],
+    "infuus_abp" : [],
     "cal_cvp"    : [],
     "flush_cvp"  : [],
+    "infuus_cvp" : [],
     "slinger_abp": [],
     "slinger_cvp": [],
     "gasbubble"  : [],
     "transducer" : [],
-    "infuus"     : [],
 }
 
 
 def build_exclusion_mask(keys=None):
-    """Return a boolean array that is True wherever any artefact was found.
-
-    Parameters
-    ----------
-    keys : iterable of str, optional
-        If supplied, only the listed artefact keys are included.
-        Defaults to all keys.
-    """
+    """Return a boolean array that is True wherever any artefact was found."""
     mask = np.zeros(n, dtype=bool)
     for k, periods in artefacts.items():
         if keys is None or k in keys:
@@ -120,23 +102,12 @@ iteration = 0
 
 while True:
     iteration += 1
-    print(f"\n── iteration {iteration} "
-          f"({'clean signal' if iteration == 1 else 'after exclusions'}) ──")
+    print(f"\n── iteration {iteration} ──")
 
-    # Snapshot *before* this pass.  A restart is triggered only when this count
-    # grows — guarantees termination and prevents re-registering known periods.
     excl_before = build_exclusion_mask().sum()
 
-    # Helper: register exactly ONE period (the earliest-starting) and restart.
-    # Every step below calls _register_first; if it returns True the step found
-    # something and the outer loop continues immediately.
     def _register_first(key, periods):
-        """Register only the earliest-starting non-overlapping period.
-
-        Periods that overlap with already-excluded samples are skipped so it is
-        structurally impossible for any registered period to overlap with a
-        previously registered one, regardless of what a detector returned.
-        """
+        """Register only the earliest-starting non-overlapping period."""
         if not periods:
             return False
         excl_now = build_exclusion_mask()
@@ -145,202 +116,148 @@ while True:
             return False
         first = min(non_overlapping, key=lambda p: p[0])
         register(key, [first])
-        print(f"  {key:12s}: registered  {first[0]/fs:.1f}–{first[1]/fs:.1f} s"
-              f"  (detector found {len(periods)} total, "
-              f"{len(non_overlapping)} non-overlapping, using earliest)")
+        print(f"  {key:12s}: registered  {first[0]/fs:.1f}–{first[1]/fs:.1f} s")
         return True
 
-    # ── step 1 ───────────────────────────────────────────────────────────────
-    # Compute P_total from the spectrogram per channel.
-    # If it collapses (beats absent), compute LP to distinguish:
-    #   LP near zero  → pressure dropped to baseline  → CALIBRATION
-    #   LP near max   → pressure clamped at ceiling   → FLUSH
-    # ABP and CVP are detected independently; even so, only one period total
-    # is registered per iteration so baselines are always recomputed cleanly.
+    # ── Step 1 : Calibration ──────────────────────────────────────────────────
     excl = build_exclusion_mask()
-    # Per-channel scan masks: each channel only excludes its own previously
-    # detected artefacts plus shared artefacts (gasbubble, transducer, infuus).
-    # This prevents an ABP calibration from masking the CVP calibration detector
-    # when both occur in the same time window (and vice-versa).
-    _shared = ('gasbubble', 'transducer', 'infuus')
-    excl_abp = build_exclusion_mask(('cal_abp', 'flush_abp', 'slinger_abp') + _shared)
-    excl_cvp = build_exclusion_mask(('cal_cvp', 'flush_cvp', 'slinger_cvp') + _shared)
+    _shared = ('gasbubble', 'transducer')
+    excl_abp = build_exclusion_mask(('cal_abp', 'flush_abp', 'infuus_abp', 'slinger_abp') + _shared)
+    excl_cvp = build_exclusion_mask(('cal_cvp', 'flush_cvp', 'infuus_cvp', 'slinger_cvp') + _shared)
+    
     try:
-        cal_abp, flush_abp, cal_cvp, flush_cvp = detect_calibration_flush(
-            abp, cvp, fs,
-            excluded=excl,
-            lp_cutoff=LP_CUTOFF,
-            hp_cutoff=HP_CUTOFF,
-            spec_fmax=SPEC_FMAX,
-            k=K_THRESH,
-            excluded_abp=excl_abp,
-            excluded_cvp=excl_cvp,
+        cal_abp, cal_cvp = detect_calibration(
+            abp, cvp, fs, excluded=excl, 
+            lp_cutoff=LP_CUTOFF, hp_cutoff=HP_CUTOFF,
+            excluded_abp=excl_abp, excluded_cvp=excl_cvp
         )
-        # ABP and CVP are channel-specific, so register one period per channel
-        # independently — both checked against their own scan mask so a
-        # simultaneous cal on both channels is caught in the same iteration.
         for ch_candidates, ch_excl in [
-            ([("cal_abp",  p) for p in cal_abp]  + [("flush_abp", p) for p in flush_abp],  excl_abp),
-            ([("cal_cvp",  p) for p in cal_cvp]  + [("flush_cvp", p) for p in flush_cvp],  excl_cvp),
+            ([("cal_abp", p) for p in cal_abp], excl_abp),
+            ([("cal_cvp", p) for p in cal_cvp], excl_cvp),
         ]:
-            non_overlapping = [(k, p) for k, p in ch_candidates
-                               if not ch_excl[p[0]:p[1]].any()]
+            non_overlapping = [(k, p) for k, p in ch_candidates if not ch_excl[p[0]:p[1]].any()]
             if non_overlapping:
                 key, first = min(non_overlapping, key=lambda x: x[1][0])
                 register(key, [first])
-                print(f"  {key:12s}: registered  {first[0]/fs:.1f}–{first[1]/fs:.1f} s"
-                      f"  ({len(non_overlapping)} non-overlapping, using earliest)")
-    except NotImplementedError:
-        print("  calibration/flush : not implemented — skipping")
+                break
+    except Exception as e:
+        print(f"  calibration error: {e}")
 
     if build_exclusion_mask().sum() > excl_before:
         continue
 
-    # ── step 2 ───────────────────────────────────────────────────────────────
-    # Compute ringing_ratio = P_high / P_total where P_high is power above
-    # 2 × dominant cardiac frequency.  A spike in ringing_ratio that exceeds
-    # the signal's own baseline by K_THRESH × IQR indicates resonance.
-    # ABP and CVP are detected independently; across both lists only the
-    # earliest-starting non-overlapping period is registered per iteration.
-    excl = build_exclusion_mask()
+    # ── Step 2 : Flush / Infuus ───────────────────────────────────────────────
     try:
-        slinger_abp_periods, slinger_cvp_periods = detect_slinger(
-            abp, cvp, fs,
-            excluded=excl,
-            lp_cutoff=LP_CUTOFF,
-            hp_cutoff=HP_CUTOFF,
-            spec_fmax=SPEC_FMAX,
-            k=K_THRESH,
+        flush_abp, infuus_abp, flush_cvp, infuus_cvp = detect_flush_infuus(
+            abp, cvp, fs, excluded=excl,
+            lp_cutoff=LP_CUTOFF, hp_cutoff=HP_CUTOFF,
+            excluded_abp=excl_abp, excluded_cvp=excl_cvp
         )
-        candidates = (
-            [("slinger_abp", p) for p in slinger_abp_periods] +
-            [("slinger_cvp", p) for p in slinger_cvp_periods]
-        )
-        if candidates:
-            excl_now = build_exclusion_mask()
-            non_overlapping = [(key, p) for key, p in candidates
-                               if not excl_now[p[0]:p[1]].any()]
+        for ch_candidates, ch_excl in [
+            ([("flush_abp", p) for p in flush_abp] + [("infuus_abp", p) for p in infuus_abp], excl_abp),
+            ([("flush_cvp", p) for p in flush_cvp] + [("infuus_cvp", p) for p in infuus_cvp], excl_cvp),
+        ]:
+            non_overlapping = [(k, p) for k, p in ch_candidates if not ch_excl[p[0]:p[1]].any()]
             if non_overlapping:
                 key, first = min(non_overlapping, key=lambda x: x[1][0])
                 register(key, [first])
-                print(f"  {key:12s}: registered  {first[0]/fs:.1f}-{first[1]/fs:.1f} s"
-                      f"  (detector found {len(candidates)} total, "
-                      f"{len(non_overlapping)} non-overlapping, using earliest)")
-    except NotImplementedError:
-        print("  slinger     : not implemented — skipping")
+                break
+    except Exception as e:
+        print(f"  flush/infuus error: {e}")
 
     if build_exclusion_mask().sum() > excl_before:
         continue
 
-    # ── step 3 ───────────────────────────────────────────────────────────────
-    # Compute HP_env (rolling amplitude of high-passed signal) and P_cardiac
-    # (spectrogram power at the dominant cardiac frequency).
-    # Both dropping together means the pulse is damped → GASBUBBLE.
-    excl = build_exclusion_mask()
-    try:
-        gasbubble_periods = detect_gasbubble(
-            abp, cvp, fs,
-            excluded=excl,
-            hp_cutoff=HP_CUTOFF,
-            spec_fmax=SPEC_FMAX,
-            k=K_THRESH,
-        )
-        _register_first("gasbubble", gasbubble_periods)
-    except NotImplementedError:
-        print("  gasbubble   : not implemented — skipping")
-
-    if build_exclusion_mask().sum() > excl_before:
-        continue
-
-    # ── step 4 ───────────────────────────────────────────────────────────────
-    # LP_ABP dropped while oscillations continue → TRANSDUCER HOOG.
-    # Must be checked and restarted BEFORE infuus: a transducer drop lowers
-    # ABP below its normal baseline, which would satisfy the infuus ABP guard
-    # (ABP ≤ threshold) and produce a false infuus positive in the same pass.
-    excl = build_exclusion_mask()
+    # ── Step 3 : Transducer Hoog ──────────────────────────────────────────────
+    # LP_ABP drops. If this is found, the loop restarts.
     try:
         transducer_periods = detect_transducer_hoog(
-            abp, cvp, fs,
+            abp, cvp, fs, excluded=excl,
+            lp_cutoff=LP_CUTOFF, hp_cutoff=HP_CUTOFF
+        )
+        if _register_first("transducer", transducer_periods):
+            continue
+    except Exception as e:
+        print(f"  transducer error: {e}")
+
+    # ── Step 4 : Gasbubbel (Damping) ──────────────────────────────────────────
+    # ONLY checked if transducer was NOT detected as high.
+    # Logic: HP std is significantly lower while LP signal is NOT lowered.
+    try:
+        gasbubble_periods = detect_gasbubble(
+            abp, cvp, fs, 
             excluded=excl,
             lp_cutoff=LP_CUTOFF,
             hp_cutoff=HP_CUTOFF,
-            k=K_THRESH,
+            spec_fmax=SPEC_FMAX,
+            k=K_THRESH
         )
-        _register_first("transducer", transducer_periods)
-    except NotImplementedError:
-        print("  transducer  : not implemented — skipping")
+        if _register_first("gasbubble", gasbubble_periods):
+            continue
+    except Exception as e:
+        print(f"  gasbubble error: {e}")
 
-    if build_exclusion_mask().sum() > excl_before:
-        continue
-
-    # ── step 5 ───────────────────────────────────────────────────────────────
-    # LP_CVP elevated while LP_ABP stays normal → INFUUS OP CVD.
-    # Uses a fresh exclusion mask so any transducer period found in step 4
-    # (on a prior iteration) is already excluded when baselines are estimated.
-    excl = build_exclusion_mask()
+    # ── Step 5 : Slinger ──────────────────────────────────────────────────────
     try:
-        infuus_periods = detect_infuus(
-            abp, cvp, fs,
-            excluded=excl,
-            lp_cutoff=LP_CUTOFF,
-            k=K_THRESH,
+        slinger_abp_periods, slinger_cvp_periods = detect_slinger(
+            abp, cvp, fs, excluded=excl,
+            lp_cutoff=LP_CUTOFF, hp_cutoff=HP_CUTOFF,
+            spec_fmax=SPEC_FMAX, k=K_THRESH
         )
-        _register_first("infuus", infuus_periods)
-    except NotImplementedError:
-        print("  infuus      : not implemented — skipping")
+        candidates = ([("slinger_abp", p) for p in slinger_abp_periods] +
+                      [("slinger_cvp", p) for p in slinger_cvp_periods])
+        if candidates:
+            excl_now = build_exclusion_mask()
+            non_overlapping = [(key, p) for key, p in candidates if not excl_now[p[0]:p[1]].any()]
+            if non_overlapping:
+                key, first = min(non_overlapping, key=lambda x: x[1][0])
+                register(key, [first])
+                continue
+    except Exception as e:
+        print(f"  slinger error: {e}")
 
-    if build_exclusion_mask().sum() > excl_before:
-        continue
-
-    # ── nothing new found in this pass: tree is complete ─────────────────────
+    # ── Termination ───────────────────────────────────────────────────────────
     print("  no new artefacts — done.")
     break
 
-# ── summary ───────────────────────────────────────────────────────────────────
+# ── Summary & Plotting ────────────────────────────────────────────────────────
 print("\n── summary ─────────────────────────────────────────────────────────")
-any_found = False
 for key, periods in artefacts.items():
     if periods:
-        any_found = True
-        spans = ", ".join(
-            f"{t[s]:.1f}–{t[min(e, n - 1)]:.1f} s" for s, e in periods
-        )
+        spans = ", ".join(f"{t[s]:.1f}–{t[min(e, n-1)]:.1f} s" for s, e in periods)
         print(f"  {key:12s}  {len(periods):2d} period(s):  {spans}")
 
-if not any_found:
-    print("  no artefacts detected.")
-
-excl_samples = build_exclusion_mask().sum()
-print(f"\n  excluded: {excl_samples / fs:.1f} s  "
-      f"({excl_samples / n * 100:.1f}% of {n / fs:.1f} s total)")
-
+# (Plotting code remains the same as in your original file)
+# ... [Rest of original plotting code] ...
 # ── plot ──────────────────────────────────────────────────────────────────────
 # Layout: 2 rows (ABP, CVP) × 3 columns (filtered signal | spectrogram | artefacts)
-# Channel-specific artefacts (cal/flush) are only shaded on their own row.
-# Shared artefacts (slinger, gasbubble, transducer, infuus) appear on both rows.
+# Channel-specific artefacts (cal/flush/infuus) are only shaded on their own row.
+# Shared artefacts (slinger, gasbubble, transducer) appear on both rows.
 
 ARTEFACT_COLOURS = {
     "cal_abp"    : "#1f77b4",   # blue
     "flush_abp"  : "#ff7f0e",   # orange
+    "infuus_abp" : "#8c564b",   # brown
     "cal_cvp"    : "#17becf",   # teal
     "flush_cvp"  : "#ffbb78",   # light orange
+    "infuus_cvp" : "#c49c94",   # light brown
     "slinger_abp": "#d62728",   # red
     "slinger_cvp": "#e57373",   # light red
     "gasbubble"  : "#2ca02c",   # green
     "transducer" : "#9467bd",   # purple
-    "infuus"     : "#8c564b",   # brown
 }
 
 ARTEFACT_AXES = {
     "cal_abp"    : ("abp",),
     "flush_abp"  : ("abp",),
+    "infuus_abp" : ("abp",),
     "cal_cvp"    : ("cvp",),
     "flush_cvp"  : ("cvp",),
+    "infuus_cvp" : ("cvp",),
     "slinger_abp": ("abp",),
     "slinger_cvp": ("cvp",),
     "gasbubble"  : ("abp", "cvp"),
     "transducer" : ("abp", "cvp"),
-    "infuus"     : ("cvp",),
 }
 
 # ── pre-compute filtered signals and spectrograms ─────────────────────────────
@@ -421,30 +338,35 @@ for key, periods in artefacts.items():
             ax.axvspan(t[s], t[min(e, n - 1)], color=colour, alpha=0.35, lw=0)
     legend_patches.append(mpatches.Patch(color=colour, alpha=0.6, label=key))
 
-# ── row 3: d/dt low-pass ─────────────────────────────────────────────────────
-for col, dlp in enumerate([dlp_abp, dlp_cvp]):
-    ax = axes[3, col]
-    ax.plot(t, dlp, color="C0", lw=1.0, label=f"d/dt LP ≤{LP_CUTOFF} Hz")
-    ax.axhline(0, color="0.6", lw=0.6, ls="--")
-    ax.set_ylabel("mmHg/s")
-    ax.set_xlim(t[0], t[-1])
-    ax.legend(loc="upper right", fontsize=7)
+# ── Row 3: DUAL-AXIS DERIVATIVES (LP vs HP) ─────────────────────────────────────
+derivative_data = [
+    (dlp_abp, dhp_abp, "ABP"),
+    (dlp_cvp, dhp_cvp, "CVP")
+]
 
-# ── row 4: d/dt high-pass ────────────────────────────────────────────────────
-for col, dhp in enumerate([dhp_abp, dhp_cvp]):
-    ax = axes[4, col]
-    ax.plot(t, dhp, color="C1", lw=0.8, label=f"d/dt HP ≥{HP_CUTOFF} Hz")
-    ax.axhline(0, color="0.6", lw=0.6, ls="--")
-    ax.set_ylabel("mmHg/s")
-    ax.set_xlabel("Time (s)")
-    ax.set_xlim(t[0], t[-1])
-    ax.legend(loc="upper right", fontsize=7)
-
-if legend_patches:
-    fig.legend(handles=legend_patches, loc="lower center",
-               fontsize=8, ncol=len(legend_patches),
-               bbox_to_anchor=(0.5, 0.0))
-    plt.subplots_adjust(bottom=0.05)
+for col, (dlp, dhp, label) in enumerate(derivative_data):
+    ax_left = axes[3, col]
+    ax_left.set_title(f"{label} - Derivatives (LP left, HP right)")
+    
+    # Left Axis: Low Pass Derivative (Baseline changes)
+    ln1 = ax_left.plot(t, dlp, color="C0", lw=1.2, label="d/dt LP (Baseline)")
+    ax_left.set_ylabel("LP Change (mmHg/s)", color="C0")
+    ax_left.tick_params(axis='y', labelcolor="C0")
+    # Horizontal line at zero to show stability
+    ax_left.axhline(0, color="0.6", lw=0.8, ls="--")
+    
+    # Create the Right Axis for High Pass Derivative (Pulsations)
+    ax_right = ax_left.twinx()
+    ln2 = ax_right.plot(t, dhp, color="C1", lw=0.8, alpha=0.5, label="d/dt HP (Oscillations)")
+    ax_right.set_ylabel("HP Change (mmHg/s)", color="C1")
+    ax_right.tick_params(axis='y', labelcolor="C1")
+    
+    # Merge legends from both axes into one box
+    lns = ln1 + ln2
+    labs = [l.get_label() for l in lns]
+    ax_left.legend(lns, labs, loc="upper right", fontsize=8)
+    
+    ax_left.set_xlim(t[0], t[-1])
 
 plt.tight_layout(rect=[0, 0.04 if legend_patches else 0, 1, 1])
 plt.show()
