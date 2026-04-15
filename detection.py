@@ -40,7 +40,8 @@ def detect_calibration_flush(abp, cvp, fs, excluded,
     physiological range for that channel (abp_phys or cvp_phys), so artefact
     periods do not bias the baseline.
 
-    Both detectors run independently on ABP and CVP.
+    Both detectors run independently on ABP and CVP, but the cardiac period
+    is derived strictly from the ABP channel for reliability.
 
     Parameters
     ----------
@@ -102,7 +103,7 @@ def detect_calibration_flush(abp, cvp, fs, excluded,
         f_dom = freqs[band][np.argmax(fft_mag[band])]
         return 1.0 / max(f_dom, 1e-3)
 
-    def _detect_one(signal, ch_name, phys_lo, phys_hi, scan_clean):
+    def _detect_one(signal, ch_name, phys_lo, phys_hi, scan_clean, period_s):
         lp           = lowpass(signal, fs, cutoff_hz=lp_cutoff)
         phys_mask    = clean & (lp >= phys_lo) & (lp <= phys_hi)
         if phys_mask.any():
@@ -112,7 +113,6 @@ def detect_calibration_flush(abp, cvp, fs, excluded,
             print(f"    [{ch_name}] warning: no samples in physiological range "
                   f"({phys_lo}–{phys_hi} mmHg), falling back to full clean mean")
 
-        period_s       = _cardiac_period(signal)
         window         = max(int(period_s * fs), 1)   # 1 cardiac period in samples
         min_flush_samp = max(int(min_flush_s * fs), 1)
 
@@ -123,13 +123,6 @@ def detect_calibration_flush(abp, cvp, fs, excluded,
               f"flush thr={flush_threshold * lp_mean:.1f} mmHg")
 
         # ── calibration ───────────────────────────────────────────────────────
-        # Entry : a sample drops below cal_thr AND the mean of the raw signal
-        #         over the next cardiac period is also below cal_thr.
-        # Exit  : a sample rises above cal_thr AND the mean of the raw signal
-        #         over the next cardiac period is also above cal_thr.
-        # Any above-threshold trigger whose window mean does not confirm is
-        # treated as a transient: the scanner skips past the above-threshold
-        # section and resumes inside the calibration period.
         cal_thr = cal_threshold * lp_mean
 
         def _win_mean(start_idx):
@@ -144,29 +137,22 @@ def detect_calibration_flush(abp, cvp, fs, excluded,
         n = len(signal)
         _entry_misses = 0   # count unconfirmed entries for diagnostics
         while i < n:
-            # Entry trigger: sample below threshold (uses per-channel scan mask so
-            # an artefact on the other channel does not block detection here)
             if signal[i] < cal_thr and scan_clean[i]:
                 wm_entry = _win_mean(i)
-                # Confirm with window mean
                 if wm_entry < cal_thr:
                     start = i
                     print(f"    [{ch_name}] cal ENTRY confirmed  t={i/fs:.2f}s  "
                           f"signal={signal[i]:.3f}  win_mean={wm_entry:.3f}  cal_thr={cal_thr:.3f}")
                     j = i + 1
                     while j < n:
-                        # Exit trigger: sample rises above threshold
                         if signal[j] >= cal_thr:
                             wm_exit = _win_mean(j)
-                            # Confirm with window mean
                             if wm_exit >= cal_thr:
                                 print(f"    [{ch_name}] cal EXIT  confirmed  t={j/fs:.2f}s  "
                                       f"signal={signal[j]:.3f}  win_mean={wm_exit:.3f}")
                                 cal_periods.append((start, j))
                                 i = j
                                 break
-                            # Not confirmed — transient spike; skip to where
-                            # signal drops back below threshold
                             k = j + 1
                             while k < n and signal[k] >= cal_thr:
                                 k += 1
@@ -174,7 +160,6 @@ def detect_calibration_flush(abp, cvp, fs, excluded,
                         else:
                             j += 1
                     else:
-                        # Never found a confirmed exit — signal still low at end
                         print(f"    [{ch_name}] cal EXIT  at end-of-signal  start={start/fs:.2f}s")
                         cal_periods.append((start, n))
                         i = n
@@ -194,13 +179,25 @@ def detect_calibration_flush(abp, cvp, fs, excluded,
         flush_periods = _find_runs((signal > flush_threshold * lp_mean) & scan_clean, min_flush_samp)
         print(f"    [{ch_name}] flush: {len(flush_periods)} period(s)")
 
+        # Just before returning cal_periods
+        valid_cal_periods = []
+        for start, end in cal_periods:
+            if end - start >= window:
+                valid_cal_periods.append((start, end))
+            else:
+                print(f"    [{ch_name}] ignoring ultra-short cal period ({end - start} samples)")
+
+        cal_periods = valid_cal_periods
         return cal_periods, flush_periods
 
-    cal_abp,  flush_abp  = _detect_one(abp, "ABP", *abp_phys, scan_abp)
-    cal_cvp,  flush_cvp  = _detect_one(cvp, "CVP", *cvp_phys, scan_cvp)
+    # ── COMPUTE CARDIAC PERIOD ONCE USING ONLY ABP ────────────────────────
+    shared_period_s = _cardiac_period(abp)
+
+    # ── PASS TO BOTH DETECTORS ────────────────────────────────────────────
+    cal_abp,  flush_abp  = _detect_one(abp, "ABP", *abp_phys, scan_abp, shared_period_s)
+    cal_cvp,  flush_cvp  = _detect_one(cvp, "CVP", *cvp_phys, scan_cvp, shared_period_s)
+    
     return cal_abp, flush_abp, cal_cvp, flush_cvp
-
-
 # ── step 2 ─────────────────────────────────────────────────────────────────────
 
 def detect_slinger(abp, cvp, fs, excluded,
