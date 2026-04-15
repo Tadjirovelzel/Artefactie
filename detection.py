@@ -733,141 +733,64 @@ def detect_slinger(abp, cvp, fs, excluded,
 
 # ── step 5 : gas bubble ────────────────────────────────────────────────────────
 
-def detect_gasbubble(abp, cvp, fs, excluded,
-                     hp_cutoff, spec_fmax, k,
-                     # ── sensitivity / bound parameters ────────────────────
-                     min_event_s=2.0,
-                     lp_boundary_hz=0.5,
-                     spec_overlap=0.75,
-                     lp_lo_ratio=0.5,
-                     lp_hi_ratio=1.5,
-                     slinger_hp_ratio=1.5):
+def detect_gasbubble(abp, cvp, fs, mask, 
+                     hp_cutoff=0.5, 
+                     window_s=5.0, 
+                     std_reduction_ratio=0.3, 
+                     lp_stability_threshold=0.15):
     """
-    Detect gas-bubble artefacts (damped pulse, mean pressure near normal).
-
-    Strategy:
-      Same spectrogram-collapse detection as Path A of detect_calibration_flush,
-      but with the LP condition flipped to the positive: a collapsed window whose
-      LP mean stays between lp_lo_ratio and lp_hi_ratio of the clean baseline is
-      classified as a gas bubble.  An HP-std guard rejects slinger false positives.
-
-    Parameters
-    ----------
-    abp, cvp          : 1D float arrays
-    fs                : sample rate (Hz)
-    excluded          : bool array, True = already excluded
-    hp_cutoff         : high-pass cutoff (Hz) for oscillation amplitude check
-    spec_fmax         : upper frequency limit for P_total computation (Hz)
-    k                 : collapse threshold — collapsed if P_total < p75 / k
-                        (linear, not quadratic, because gas bubble damps rather
-                        than fully silences the signal)
-    min_event_s       : minimum accepted event duration (s)
-    lp_boundary_hz    : cutoff (Hz) for the LP used as mean-pressure estimator
-    spec_overlap      : fractional overlap between successive spectrogram windows
-    lp_lo_ratio       : lower LP fraction — LP mean must be ≥ lp_lo_ratio × baseline
-    lp_hi_ratio       : upper LP fraction — LP mean must be ≤ lp_hi_ratio × baseline
-    slinger_hp_ratio  : reject if HP std during candidate > slinger_hp_ratio × baseline;
-                        gas bubble damps oscillations, slinger amplifies them
-
-    Returns
-    -------
-    list of (start, end) tuples
+    Detects gas bubbles (damping) based on a significant drop in HP standard 
+    deviation while the LP mean remains stable.
     """
-    print("    [gasbubble] running gas-bubble detection")
+    n = len(abp)
+    clean = ~mask
+    if np.sum(clean) < int(10 * fs):
+        return []
 
-    n        = len(abp)
-    window_s = 2.0
-    nperseg  = max(int(window_s * fs), 32)
-    noverlap = int(nperseg * spec_overlap)
-    clean    = ~excluded
-    min_dur  = max(int(min_event_s * fs), 1)
+    # 1. Prepare signals
+    # We use ABP for detection as it has a clearer pulse pressure
+    lp = lowpass(abp, hp_cutoff, fs)
+    hp = highpass(abp, hp_cutoff, fs)
+    
+    # 2. Establish Baselines from clean signal
+    baseline_lp_mean = np.mean(lp[clean])
+    # Rolling std of HP signal is a proxy for pulse pressure
+    hp_std_series = rolling_std(hp, int(window_s * fs))
+    baseline_hp_std = np.median(hp_std_series[clean & ~np.isnan(hp_std_series)])
 
-    # ── LP baseline (ABP) ────────────────────────────────────────────────────
-    nyq  = 0.5 * fs
-    b, a = butter(2, max(lp_boundary_hz / nyq, 1e-3), btype="low")
-    lp   = filtfilt(b, a, abp)
-    lp_norm = np.median(lp[clean]) if clean.any() else np.median(lp)
-    print(f"    [gasbubble] ABP LP baseline: {lp_norm:.1f} mmHg  "
-          f"gas-bubble LP window: {lp_norm * lp_lo_ratio:.1f}–"
-          f"{lp_norm * lp_hi_ratio:.1f} mmHg")
+    if baseline_hp_std == 0:
+        return []
 
-    # ── HP std baseline — used to reject slinger false positives ─────────────
-    hp_abp      = highpass(abp, fs, cutoff_hz=hp_cutoff)
-    hp_std      = rolling_std(hp_abp, fs, window_s=1.0)
-    valid_std   = clean & ~np.isnan(hp_std)
-    hp_std_norm = (float(np.median(hp_std[valid_std])) if valid_std.any()
-                   else float(np.nanmedian(hp_std)))
-    print(f"    [gasbubble] HP-std baseline: {hp_std_norm:.2f} mmHg  "
-          f"slinger reject above: {slinger_hp_ratio:.1f}×")
-
-    # ── spectrogram P_total ──────────────────────────────────────────────────
-    freqs, times, Sxx = _spectrogram(
-        abp, fs=fs, nperseg=nperseg, noverlap=noverlap,
-        nfft=nperseg, scaling="density",
-    )
-    band    = (freqs >= 0.5) & (freqs <= spec_fmax)
-    P_total = Sxx[band, :].sum(axis=0)
-
-    half_win = nperseg // 2
-    def _ef(ti):
-        s = max(0, int(ti * fs) - half_win)
-        e = min(n, int(ti * fs) + half_win)
-        return excluded[s:e].mean() if e > s else 1.0
-
-    excl_frac = np.array([_ef(ti) for ti in times])
-    clean_win = excl_frac < 0.5
-    scan_win  = excl_frac < 0.9
-
+    # 3. Detection Logic
+    # Damped: HP std is significantly lower than baseline
+    is_damped = hp_std_series < (baseline_hp_std * std_reduction_ratio)
+    
+    # Stable LP: Current LP mean is NOT significantly lower than baseline
+    # (Checking that it stays within a certain % of the baseline)
+    lp_is_stable = np.abs(lp - baseline_lp_mean) < (baseline_lp_mean * lp_stability_threshold)
+    
+    # Combine conditions
+    candidate_mask = is_damped & lp_is_stable & clean
+    
+    # 4. Group into periods
     periods = []
+    in_period = False
+    start_idx = 0
+    
+    # Min duration for a damping event (e.g., 3 seconds)
+    min_samples = int(3 * fs)
 
-    if clean_win.sum() < 4:
-        print("    [gasbubble] not enough clean windows — skipped")
-        return periods
+    for i in range(n):
+        if candidate_mask[i] and not in_period:
+            start_idx = i
+            in_period = True
+        elif not candidate_mask[i] and in_period:
+            if i - start_idx >= min_samples:
+                periods.append((start_idx, i))
+            in_period = False
+            
+    if in_period and (n - start_idx >= min_samples):
+        periods.append((start_idx, n))
 
-    p75          = np.percentile(P_total[clean_win], 75)
-    collapse_thr = p75 / k
-    collapsed    = (P_total < collapse_thr) & scan_win
-    print(f"    [gasbubble] P_total p75={p75:.2e}  "
-          f"collapse threshold={collapse_thr:.2e}  "
-          f"collapsed windows={collapsed.sum()}")
-
-    # ── scan collapsed runs ──────────────────────────────────────────────────
-    i = 0
-    while i < len(times):
-        if collapsed[i]:
-            j = i + 1
-            while j < len(times) and collapsed[j]:
-                j += 1
-
-            s_rough = max(0, int((times[i]     - window_s / 2) * fs))
-            e_rough = min(n, int((times[j - 1] + window_s / 2) * fs))
-
-            lp_mean = lp[s_rough:e_rough].mean()
-
-            if lp_norm * lp_lo_ratio <= lp_mean <= lp_norm * lp_hi_ratio:
-                seg_std = hp_std[s_rough:e_rough]
-                seg_std = seg_std[~np.isnan(seg_std)]
-                if seg_std.size > 0 and seg_std.mean() > hp_std_norm * slinger_hp_ratio:
-                    print(f"    [gasbubble] {s_rough/fs:.1f}–{e_rough/fs:.1f} s: "
-                          f"HP std elevated ({seg_std.mean():.2f} vs baseline "
-                          f"{hp_std_norm:.2f}) — likely slinger, not gas bubble")
-                elif e_rough - s_rough >= min_dur:
-                    periods.append((s_rough, e_rough))
-                    mean_std = float(seg_std.mean()) if seg_std.size > 0 else float("nan")
-                    print(f"    [gasbubble] period  "
-                          f"{s_rough/fs:.1f}–{e_rough/fs:.1f} s  "
-                          f"(LP {lp_mean:.1f} mmHg  HP std {mean_std:.2f} mmHg)")
-                else:
-                    print(f"    [gasbubble] too short "
-                          f"({(e_rough - s_rough)/fs:.2f} s) — skipped")
-            else:
-                print(f"    [gasbubble] LP={lp_mean:.1f} outside gas-bubble range "
-                      f"— not gas bubble (cal or flush)")
-
-            i = j
-        else:
-            i += 1
-
-    print(f"    [gasbubble] result: {len(periods)} period(s)")
     return periods
 
