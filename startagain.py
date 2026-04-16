@@ -97,6 +97,9 @@ def register(key, new_periods):
     artefacts[key].extend(new_periods)
 
 
+# ── slinger diagnostic data (captured from the last slinger run) ──────────────
+slinger_diag_abp = slinger_diag_cvp = None
+
 # ── decision tree (iterative) ─────────────────────────────────────────────────
 iteration = 0
 
@@ -185,12 +188,10 @@ while True:
     # Logic: HP std is significantly lower while LP signal is NOT lowered.
     try:
         gasbubble_periods = detect_gasbubble(
-            abp, cvp, fs, 
-            excluded=excl,
+            abp, cvp, fs,
+            mask=excl,
             lp_cutoff=LP_CUTOFF,
             hp_cutoff=HP_CUTOFF,
-            spec_fmax=SPEC_FMAX,
-            k=K_THRESH
         )
         if _register_first("gasbubble", gasbubble_periods):
             continue
@@ -198,21 +199,23 @@ while True:
         print(f"  gasbubble error: {e}")
 
     # ── Step 5 : Slinger ──────────────────────────────────────────────────────
+    # All slinger periods are registered in one go — no exclusion between them.
     try:
-        slinger_abp_periods, slinger_cvp_periods = detect_slinger(
+        slinger_abp_periods, slinger_cvp_periods, diag_abp, diag_cvp = detect_slinger(
             abp, cvp, fs, excluded=excl,
-            lp_cutoff=LP_CUTOFF, hp_cutoff=HP_CUTOFF,
-            spec_fmax=SPEC_FMAX, k=K_THRESH
         )
-        candidates = ([("slinger_abp", p) for p in slinger_abp_periods] +
-                      [("slinger_cvp", p) for p in slinger_cvp_periods])
-        if candidates:
-            excl_now = build_exclusion_mask()
-            non_overlapping = [(key, p) for key, p in candidates if not excl_now[p[0]:p[1]].any()]
-            if non_overlapping:
-                key, first = min(non_overlapping, key=lambda x: x[1][0])
-                register(key, [first])
-                continue
+        slinger_diag_abp, slinger_diag_cvp = diag_abp, diag_cvp
+        excl_now = build_exclusion_mask()
+        new_abp = [p for p in slinger_abp_periods if not excl_now[p[0]:p[1]].any()]
+        new_cvp = [p for p in slinger_cvp_periods if not excl_now[p[0]:p[1]].any()]
+        if new_abp or new_cvp:
+            register("slinger_abp", new_abp)
+            register("slinger_cvp", new_cvp)
+            for p in new_abp:
+                print(f"  slinger_abp  : registered  {p[0]/fs:.1f}–{p[1]/fs:.1f} s")
+            for p in new_cvp:
+                print(f"  slinger_cvp  : registered  {p[0]/fs:.1f}–{p[1]/fs:.1f} s")
+            continue
     except Exception as e:
         print(f"  slinger error: {e}")
 
@@ -269,20 +272,15 @@ hp_cvp = highpass(cvp, fs, cutoff_hz=HP_CUTOFF)
 f_abp, ts_abp, S_abp = compute_spectrogram(abp, fs, fmax=SPEC_FMAX)
 f_cvp, ts_cvp, S_cvp = compute_spectrogram(cvp, fs, fmax=SPEC_FMAX)
 
-dlp_abp = np.gradient(lp_abp, 1.0 / fs)
-dhp_abp  = np.gradient(hp_abp, 1.0 / fs)
-dlp_cvp  = np.gradient(lp_cvp, 1.0 / fs)
-dhp_cvp  = np.gradient(hp_cvp, 1.0 / fs)
-
 # ── figure ────────────────────────────────────────────────────────────────────
 # Row 0: filtered signals  |  Row 1: spectrograms
-# Row 2: detected artefacts|  Row 3: LP & HP derivatives
+# Row 2: detected artefacts|  Row 3: slinger HF diagnostic
 # Col 0: ABP               |  Col 1: CVP
-fig, axes = plt.subplots(5, 2, figsize=(14, 22), sharex="row")
+fig, axes = plt.subplots(4, 2, figsize=(14, 14), sharex="row")
 fig.suptitle(os.path.basename(path), fontsize=11)
 
 row_titles = ["Filtered signal", "Spectrogram", "Detected artefacts",
-              "d/dt Low-pass", "d/dt High-pass"]
+              "Slinger HF energy"]
 for row, title in enumerate(row_titles):
     axes[row, 0].set_title(f"ABP — {title}", fontsize=10)
     axes[row, 1].set_title(f"CVP — {title}", fontsize=10)
@@ -338,35 +336,24 @@ for key, periods in artefacts.items():
             ax.axvspan(t[s], t[min(e, n - 1)], color=colour, alpha=0.35, lw=0)
     legend_patches.append(mpatches.Patch(color=colour, alpha=0.6, label=key))
 
-# ── Row 3: DUAL-AXIS DERIVATIVES (LP vs HP) ─────────────────────────────────────
-derivative_data = [
-    (dlp_abp, dhp_abp, "ABP"),
-    (dlp_cvp, dhp_cvp, "CVP")
-]
-
-for col, (dlp, dhp, label) in enumerate(derivative_data):
-    ax_left = axes[3, col]
-    ax_left.set_title(f"{label} - Derivatives (LP left, HP right)")
-    
-    # Left Axis: Low Pass Derivative (Baseline changes)
-    ln1 = ax_left.plot(t, dlp, color="C0", lw=1.2, label="d/dt LP (Baseline)")
-    ax_left.set_ylabel("LP Change (mmHg/s)", color="C0")
-    ax_left.tick_params(axis='y', labelcolor="C0")
-    # Horizontal line at zero to show stability
-    ax_left.axhline(0, color="0.6", lw=0.8, ls="--")
-    
-    # Create the Right Axis for High Pass Derivative (Pulsations)
-    ax_right = ax_left.twinx()
-    ln2 = ax_right.plot(t, dhp, color="C1", lw=0.8, alpha=0.5, label="d/dt HP (Oscillations)")
-    ax_right.set_ylabel("HP Change (mmHg/s)", color="C1")
-    ax_right.tick_params(axis='y', labelcolor="C1")
-    
-    # Merge legends from both axes into one box
-    lns = ln1 + ln2
-    labs = [l.get_label() for l in lns]
-    ax_left.legend(lns, labs, loc="upper right", fontsize=8)
-    
-    ax_left.set_xlim(t[0], t[-1])
+# ── row 3: slinger HF diagnostic ─────────────────────────────────────────────
+for col, (diag, slinger_key, colour) in enumerate([
+    (slinger_diag_abp, "slinger_abp", ARTEFACT_COLOURS["slinger_abp"]),
+    (slinger_diag_cvp, "slinger_cvp", ARTEFACT_COLOURS["slinger_cvp"]),
+]):
+    ax = axes[3, col]
+    if diag is not None:
+        ax.plot(diag["ts"], diag["hf_log"],    color="0.75", lw=0.8, label="HF energy (log)")
+        ax.plot(diag["ts"], diag["hf_smooth"], color="C0",   lw=1.2, label="Smoothed")
+        ax.axhline(diag["threshold"], color="C3", lw=1.0, ls="--", label="Threshold")
+        for s, e in artefacts[slinger_key]:
+            ax.axvspan(t[s], t[min(e, n - 1)], color=colour, alpha=0.35, lw=0)
+        ax.set_ylabel("log(1 + HF power)")
+        ax.set_xlim(diag["ts"][0], diag["ts"][-1])
+        ax.legend(loc="upper right", fontsize=7, ncol=3)
+    else:
+        ax.text(0.5, 0.5, "no slinger run", transform=ax.transAxes,
+                ha="center", va="center", color="0.5")
 
 plt.tight_layout(rect=[0, 0.04 if legend_patches else 0, 1, 1])
 plt.show()
