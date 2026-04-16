@@ -1,48 +1,10 @@
 """
 signal_helpers.py
-Helper functions for loading, filtering, and visualising pressure signals.
+Helper functions for filtering and spectral analysis of pressure signals.
 """
 
 import numpy as np
-import pandas as pd
 from scipy.signal import butter, filtfilt, spectrogram as _spectrogram
-import matplotlib.pyplot as plt
-import matplotlib.gridspec as gridspec
-
-
-# ---------------------------------------------------------------------------
-# Loading
-# ---------------------------------------------------------------------------
-
-def load_signal(path):
-    """
-    Load a pressure recording from an Excel file.
-
-    Expected layout
-    ---------------
-    Row 0 : column headers  (Time, ABP, CVP)
-    Row 1 : units           (s, mmHg, mmHg)
-    Row 2+: numeric data
-
-    Returns
-    -------
-    t   : 1D float array  — time relative to the first sample (s)
-    abp : 1D float array  — arterial blood pressure (mmHg)
-    cvp : 1D float array  — central venous pressure (mmHg)
-    fs  : float           — sample rate (Hz), inferred from time column
-    """
-    df = pd.read_excel(path, header=0, skiprows=[1])
-    t_abs = pd.to_numeric(df["Time"], errors="coerce").values
-    abp   = pd.to_numeric(df["ABP"],  errors="coerce").values
-    cvp   = pd.to_numeric(df["CVP"],  errors="coerce").values
-
-    # Drop any NaN rows
-    valid = ~(np.isnan(t_abs) | np.isnan(abp) | np.isnan(cvp))
-    t_abs, abp, cvp = t_abs[valid], abp[valid], cvp[valid]
-
-    t  = t_abs - t_abs[0]
-    fs = 1.0 / np.median(np.diff(t_abs))
-    return t, abp, cvp, fs
 
 
 # ---------------------------------------------------------------------------
@@ -151,61 +113,3 @@ def compute_spectrogram(signal, fs, window_s=2.0, overlap_frac=0.75,
     Sxx_db = np.clip(Sxx_db, Sxx_db.max() - 60, None)
     return freqs, times, Sxx_db
 
-
-# ---------------------------------------------------------------------------
-# Plotting helpers
-# ---------------------------------------------------------------------------
-
-def plot_signal_overview(t, raw, lp, hp, std,
-                         label, lp_cutoff, hp_cutoff, window_s,
-                         axes):
-    """
-    Fill one row of axes with raw/LP/HP signals and rolling std.
-
-    Parameters
-    ----------
-    t, raw, lp, hp, std : 1D arrays (same length)
-    label               : channel name string, e.g. "ABP"
-    lp_cutoff           : low-pass cutoff (Hz) — for legend
-    hp_cutoff           : high-pass cutoff (Hz) — for legend
-    window_s            : rolling-std window (s) — for legend
-    axes                : sequence of 2 Axes — [signal_ax, std_ax]
-    """
-    ax_sig, ax_std = axes
-
-    ax_sig.plot(t, raw, color="0.7", lw=0.8, label="Raw")
-    ax_sig.plot(t, lp,  color="C0", lw=1.2,
-                label=f"Low-pass  ≤{lp_cutoff} Hz")
-    ax_sig.plot(t, hp,  color="C1", lw=1.0,
-                label=f"High-pass ≥{hp_cutoff} Hz")
-    ax_sig.set_ylabel(f"{label} (mmHg)")
-    ax_sig.legend(loc="upper right", fontsize=7, ncol=3)
-    ax_sig.set_xlim(t[0], t[-1])
-    ax_sig.tick_params(labelbottom=False)
-
-    ax_std.plot(t, std, color="C2", lw=1.0,
-                label=f"Rolling σ ({window_s} s window)")
-    ax_std.set_ylabel("σ (mmHg)")
-    ax_std.legend(loc="upper right", fontsize=7)
-    ax_std.set_xlim(t[0], t[-1])
-
-
-def plot_spectrogram(freqs, times, Sxx_db, label, ax, fs):
-    """
-    Draw a filled spectrogram on *ax*.
-
-    Parameters
-    ----------
-    freqs, times, Sxx_db : output of compute_spectrogram
-    label                : channel name string
-    ax                   : Axes to draw on
-    fs                   : sample rate — used only to annotate Nyquist
-    """
-    pcm = ax.pcolormesh(times, freqs, Sxx_db,
-                        shading="gouraud", cmap="inferno")
-    plt.colorbar(pcm, ax=ax, label="Power (dB)")
-    ax.set_ylabel("Frequency (Hz)")
-    ax.set_xlabel("Time (s)")
-    ax.set_title(f"{label} spectrogram")
-    ax.set_ylim(freqs[0], freqs[-1])
-    ax.set_xlim(times[0], times[-1])

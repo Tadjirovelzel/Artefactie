@@ -10,7 +10,7 @@ that previously detected artefacts do not bias the thresholds.
 """
 
 import numpy as np
-from scipy.signal import spectrogram as _spectrogram, butter, filtfilt
+import pandas as pd
 from signal_helpers import lowpass, highpass, rolling_std
 
 
@@ -88,9 +88,8 @@ def detect_calibration(abp, cvp, fs, excluded,
     period_s = _estimate_cardiac_period(abp, clean, fs,
                                          fmin=cardiac_fmin, fmax=cardiac_fmax)
     window   = max(int(period_s * fs), 1)
-    print(f"  [calibration] cardiac period={period_s:.2f} s  window={window} smp")
 
-    def _detect_cal(signal, ch_name, phys_lo, phys_hi, scan_clean):
+    def _detect_cal(signal, phys_lo, phys_hi, scan_clean):
         lp        = lowpass(signal, fs, cutoff_hz=lp_cutoff)
         phys_mask = clean & (lp >= phys_lo) & (lp <= phys_hi)
         lp_mean   = (np.mean(lp[phys_mask]) if phys_mask.any() else
@@ -104,9 +103,6 @@ def detect_calibration(abp, cvp, fs, excluded,
         valid_std = clean & ~np.isnan(hp_std_r)
         hp_base   = (float(np.median(hp_std_r[valid_std])) if valid_std.any()
                      else float(np.nanmedian(hp_std_r)))
-
-        print(f"    [{ch_name}] LP mean={lp_mean:.1f} mmHg  cal_thr={cal_thr:.2f} mmHg  "
-              f"HP std base={hp_base:.2f} mmHg  max={hp_max_ratio:.1f}×")
 
         def _win_mean(idx):
             return np.mean(signal[idx : min(idx + window, n)])
@@ -150,19 +146,13 @@ def detect_calibration(abp, cvp, fs, excluded,
             seg      = seg[~np.isnan(seg)]
             median_hp = float(np.median(seg)) if seg.size > 0 else 0.0
             ratio    = median_hp / hp_base if hp_base > 0 else 0.0
-            if ratio > hp_max_ratio:
-                print(f"    [{ch_name}] cal {start/fs:.1f}–{end/fs:.1f} s rejected: "
-                      f"HP std median {median_hp:.2f} ({ratio:.2f}x base) — oscillations "
-                      f"continue, likely transducer hoog")
-            else:
+            if ratio <= hp_max_ratio:
                 periods.append((start, end))
 
-        print(f"    [{ch_name}] cal: {len(periods)} period(s)  "
-              f"({len(raw_periods) - len(periods)} rejected by HP guard)")
         return periods
 
-    cal_abp = _detect_cal(abp, "ABP", *abp_phys, scan_abp)
-    cal_cvp = _detect_cal(cvp, "CVP", *cvp_phys, scan_cvp)
+    cal_abp = _detect_cal(abp, *abp_phys, scan_abp)
+    cal_cvp = _detect_cal(cvp, *cvp_phys, scan_cvp)
     return cal_abp, cal_cvp
 
 
@@ -222,10 +212,8 @@ def detect_flush_infuus(abp, cvp, fs, excluded,
                                                fmin=cardiac_fmin, fmax=cardiac_fmax)
     window         = max(int(period_s * fs), 1)
     min_flush_samp = max(int(min_flush_cycles * window), 1)
-    print(f"  [flush/infuus] cardiac period={period_s:.2f} s  window={window} smp  "
-          f"min_flush={min_flush_cycles} cycle(s)={min_flush_samp} smp")
 
-    def _detect_high(signal, ch_name, phys_lo, phys_hi, scan_clean):
+    def _detect_high(signal, phys_lo, phys_hi, scan_clean):
         lp        = lowpass(signal, fs, cutoff_hz=lp_cutoff)
         phys_mask = clean & (lp >= phys_lo) & (lp <= phys_hi)
         lp_mean   = (np.mean(lp[phys_mask]) if phys_mask.any() else
@@ -236,10 +224,6 @@ def detect_flush_infuus(abp, cvp, fs, excluded,
         # HP signal for oscillation classification
         hp          = highpass(signal, fs, cutoff_hz=hp_cutoff)
         hp_std_roll = rolling_std(hp, fs, window_s=1.0)
-
-        print(f"    [{ch_name}] LP mean={lp_mean:.1f} mmHg  "
-              f"flush_thr={flush_thr:.1f} mmHg  "
-              f"infuus: dur≥{infuus_min_s:.0f}s AND HP≥{infuus_hp_ratio:.1f}×base")
 
         def _win_mean(idx):
             return np.mean(signal[idx : min(idx + window, n)])
@@ -281,8 +265,6 @@ def detect_flush_infuus(abp, cvp, fs, excluded,
         baseline_valid = clean & ~high_mask & ~np.isnan(hp_std_roll)
         hp_std_base    = (float(np.median(hp_std_roll[baseline_valid]))
                           if baseline_valid.any() else float(np.nanmedian(hp_std_roll)))
-        print(f"    [{ch_name}] HP std baseline={hp_std_base:.2f} mmHg")
-
         # ── classify each period ──────────────────────────────────────────────
         flush_periods  = []
         infuus_periods = []
@@ -294,17 +276,12 @@ def detect_flush_infuus(abp, cvp, fs, excluded,
             hp_ratio    = mean_hp_std / hp_std_base if hp_std_base > 0 else 0.0
 
             is_infuus = (duration_s >= infuus_min_s and hp_ratio >= infuus_hp_ratio)
-            label = "infuus" if is_infuus else "flush"
             (infuus_periods if is_infuus else flush_periods).append((start, end))
-            print(f"    [{ch_name}] → {label:6s}  {start/fs:.1f}–{end/fs:.1f} s  "
-                  f"dur={duration_s:.1f}s  HP std={mean_hp_std:.2f} "
-                  f"({hp_ratio:.2f}× baseline)")
 
-        print(f"    [{ch_name}] flush: {len(flush_periods)}  infuus: {len(infuus_periods)}")
         return flush_periods, infuus_periods
 
-    flush_abp, infuus_abp = _detect_high(abp, "ABP", *abp_phys, scan_abp)
-    flush_cvp, infuus_cvp = _detect_high(cvp, "CVP", *cvp_phys, scan_cvp)
+    flush_abp, infuus_abp = _detect_high(abp, *abp_phys, scan_abp)
+    flush_cvp, infuus_cvp = _detect_high(cvp, *cvp_phys, scan_cvp)
     return flush_abp, infuus_abp, flush_cvp, infuus_cvp
 
 
@@ -368,11 +345,6 @@ def detect_transducer_hoog(abp, cvp, fs, excluded,
     period_s = _estimate_cardiac_period(abp, clean, fs)
     gap_samp = max(int(period_s * fs), 1)
 
-    print(f"    [transducer] LP baseline={lp_baseline:.1f} mmHg  "
-          f"threshold<{threshold:.1f} ({lp_drop_ratio:.0%})")
-    print(f"    [transducer] HP-std baseline={hp_std_base:.2f} mmHg  "
-          f"accept: [{hp_lo_ratio:.1f}×, {hp_hi_ratio:.1f}×]")
-
     # ── find runs below threshold ─────────────────────────────────────────────
     below = (lp_abp < threshold) & clean
 
@@ -406,22 +378,12 @@ def detect_transducer_hoog(abp, cvp, fs, excluded,
         seg_std  = seg_std[~np.isnan(seg_std)]
         mean_std = float(seg_std.mean()) if seg_std.size > 0 else 0.0
         ratio    = mean_std / hp_std_base if hp_std_base > 0 else 0.0
-        mean_lp  = float(lp_abp[start:end].mean())
 
-        if ratio < hp_lo_ratio:
-            print(f"    [transducer] {start/fs:.1f}–{end/fs:.1f} s: "
-                  f"HP std {mean_std:.2f} ({ratio:.2f}× base) — oscillations absent, rejected")
-            continue
-        if ratio > hp_hi_ratio:
-            print(f"    [transducer] {start/fs:.1f}–{end/fs:.1f} s: "
-                  f"HP std {mean_std:.2f} ({ratio:.2f}× base) — oscillations elevated, rejected")
+        if ratio < hp_lo_ratio or ratio > hp_hi_ratio:
             continue
 
         periods.append((start, end))
-        print(f"    [transducer] period  {start/fs:.1f}–{end/fs:.1f} s  "
-              f"(LP {mean_lp:.1f} mmHg  HP std {mean_std:.2f} ({ratio:.2f}× base))")
 
-    print(f"    [transducer] result: {len(periods)} period(s)")
     return periods
 
 
@@ -458,7 +420,7 @@ def detect_gasbubble(abp, cvp, fs, mask,
     window   = max(int(period_s * fs), 1)
     min_samp = max(int(min_event_s * fs), 1)
 
-    def _detect_one(signal, ch_name):
+    def _detect_one(signal):
         lp       = lowpass(signal,  fs, cutoff_hz=lp_cutoff)
         hp       = highpass(signal, fs, cutoff_hz=hp_cutoff)
 
@@ -469,7 +431,6 @@ def detect_gasbubble(abp, cvp, fs, mask,
                                  else np.nanmedian(hp_std_r))
 
         if baseline_hp_std == 0:
-            print(f"    [gasbubble/{ch_name}] HP-std baseline is zero — skipping")
             return []
 
         # LP stability is NOT checked sample-by-sample: MAP can drift over a
@@ -477,10 +438,6 @@ def detect_gasbubble(abp, cvp, fs, mask,
         # many.  LP is checked as a guard over the full detected period instead.
         is_damped = hp_std_r < (baseline_hp_std * std_reduction_ratio)
         candidate = is_damped & clean
-
-        print(f"    [gasbubble/{ch_name}] LP baseline={baseline_lp_mean:.1f} mmHg  "
-              f"HP-std baseline={baseline_hp_std:.2f} mmHg  "
-              f"damping thr={baseline_hp_std * std_reduction_ratio:.2f} mmHg")
 
         def _win_frac(idx):
             seg = candidate[idx : min(idx + window, n)]
@@ -519,166 +476,227 @@ def detect_gasbubble(abp, cvp, fs, mask,
         for start, end in raw_periods:
             mean_lp = float(np.mean(lp[start:end]))
             lp_dev  = abs(mean_lp - baseline_lp_mean) / baseline_lp_mean
-            if lp_dev > lp_stability_threshold:
-                print(f"    [gasbubble/{ch_name}] {start/fs:.1f}–{end/fs:.1f} s rejected: "
-                      f"LP mean {mean_lp:.1f} mmHg deviates {lp_dev:.0%} from baseline")
-            else:
+            if lp_dev <= lp_stability_threshold:
                 periods.append((start, end))
-                print(f"    [gasbubble/{ch_name}] period  {start/fs:.1f}–{end/fs:.1f} s  "
-                      f"({(end-start)/fs:.1f} s)")
 
-        print(f"    [gasbubble/{ch_name}] result: {len(periods)} period(s)")
         return periods
 
-    gasbubble_abp = _detect_one(abp, "abp")
-    gasbubble_cvp = _detect_one(cvp, "cvp")
+    gasbubble_abp = _detect_one(abp)
+    gasbubble_cvp = _detect_one(cvp)
     return gasbubble_abp, gasbubble_cvp
 
 # ── step 5 : slinger (last resort — only runs when no other artefacts remain) ──
 
+def _rolling_mean(x: np.ndarray, win: int) -> np.ndarray:
+    return (
+        pd.Series(x)
+        .rolling(win, center=True, min_periods=max(1, win // 3))
+        .mean()
+        .to_numpy()
+    )
+
+
+def _rolling_median(x: np.ndarray, win: int) -> np.ndarray:
+    return (
+        pd.Series(x)
+        .rolling(win, center=True, min_periods=max(1, win // 3))
+        .median()
+        .to_numpy()
+    )
+
+
+def _mask_to_periods(mask: np.ndarray, min_region_s: float,
+                     merge_gap_s: float, fs: float) -> list:
+    """
+    Convert a boolean sample mask to a list of (start_idx, end_idx) tuples.
+
+    Small False gaps between True runs are filled (merge_gap_s), then runs
+    shorter than min_region_s are removed.
+    """
+    mask = mask.copy()
+    n          = len(mask)
+    merge_samp = max(1, int(round(merge_gap_s * fs)))
+    min_samp   = max(1, int(round(min_region_s * fs)))
+
+    # Fill short gaps
+    i = 0
+    while i < n:
+        if not mask[i]:
+            j = i
+            while j < n and not mask[j]:
+                j += 1
+            if i > 0 and j < n and (j - i) <= merge_samp:
+                mask[i:j] = True
+            i = j
+        else:
+            i += 1
+
+    # Remove short runs
+    i = 0
+    while i < n:
+        if mask[i]:
+            j = i
+            while j < n and mask[j]:
+                j += 1
+            if (j - i) < min_samp:
+                mask[i:j] = False
+            i = j
+        else:
+            i += 1
+
+    # Collect (start, end) pairs
+    periods = []
+    i = 0
+    while i < n:
+        if mask[i]:
+            j = i
+            while j < n and mask[j]:
+                j += 1
+            periods.append((i, j))
+            i = j
+        else:
+            i += 1
+    return periods
+
+
 def detect_slinger(abp, cvp, fs, excluded,
-                   hf_low=8.0,
-                   hf_high=20.0,
-                   k=7,
-                   smooth_window=5,
-                   fill_gap_bins=2,
-                   min_event_s=1.0):
+                   # ABP channel settings
+                   abp_baseline_window_s=0.25,
+                   abp_feature_window_s=0.50,
+                   abp_trend_window_s=1.00,
+                   abp_z_threshold=4.0,
+                   abp_score_threshold=10.0,
+                   abp_min_region_s=0.40,
+                   abp_merge_gap_s=1.20,
+                   # CVP channel settings
+                   cvp_baseline_window_s=0.25,
+                   cvp_feature_window_s=0.60,
+                   cvp_trend_window_s=1.20,
+                   cvp_z_threshold=3.5,
+                   cvp_score_threshold=8.0,
+                   cvp_min_region_s=0.30,
+                   cvp_merge_gap_s=0.80):
     """
     Detect resonance / ringing artefacts (slinger), separately per channel.
 
-    Characteristic: a burst of high-frequency energy (hf_low–hf_high Hz) that
-    stands out above the baseline HF level.
+    Uses a time-domain approach: robust z-scores of residual RMS (signal minus
+    local median baseline), absolute slope, and trend deviation are combined
+    into a detection score.  Regions where the score exceeds the threshold are
+    flagged as slinger.  All statistics are computed from non-excluded samples
+    only, so previously detected artefacts do not bias the detection.
 
-    For each channel:
-    1. Compute the spectrogram (1 s window, 0.5 s overlap, 2 s nfft) with
-       reflect-padding to avoid edge artefacts.
-    2. Sum power in the HF band; log-transform then smooth with a rolling mean.
-    3. Estimate the baseline from non-excluded (clean) spectrogram bins:
-       threshold = mean(clean HF power) + k × std(clean HF power).
-    4. Fill small inter-bin gaps (fill_gap_bins), mask excluded bins, then keep
-       runs that meet min_event_s.
-
-    Parameters
-    ----------
-    hf_low / hf_high : HF band limits for ringing energy (Hz)
-    k                : threshold multiplier  (clean_mean + k × clean_std)
-    smooth_window    : rolling-mean window in spectrogram bins
-    fill_gap_bins    : dilation width to bridge short inter-segment gaps
-    min_event_s      : minimum accepted event duration (s)
+    Algorithm (per channel)
+    -----------------------
+    1. Baseline  = rolling median (short window) → captures the local mean.
+    2. Residual  = signal − baseline → isolates fast oscillations.
+    3. Features  = residual RMS, absolute slope, and trend deviation, each
+                   smoothed over feature_window_s.
+    4. z-scores  = robust (median/MAD) z-scores computed on the clean (non-
+                   excluded) samples only, then clipped to zero.
+    5. Score     = 1.0×z_residual + 1.0×z_slope + 0.4×z_deviation.
+    6. Mask      = (z_residual > z_threshold AND z_slope > z_threshold)
+                   OR score > score_threshold, restricted to clean samples.
+    7. Post-processing: merge short gaps (merge_gap_s), drop short regions
+                   (min_region_s).
 
     Returns
     -------
-    slinger_abp, slinger_cvp : two lists of (start_idx, end_idx) tuples
+    slinger_abp, slinger_cvp : lists of (start_idx, end_idx) sample-index tuples
+    diag_abp, diag_cvp       : dicts with 'ts', 'hf_ratio' (z_residual),
+                               'hf_smooth' (combined score), 'threshold'
     """
-    n        = len(abp)
-    nperseg  = max(int(1.0 * fs), 32)
-    noverlap = int(0.5 * fs)
-    nfft     = int(2.0 * fs)
-    pad      = nperseg // 2
-    half_win_s = nperseg / (2.0 * fs)
+    n     = len(abp)
+    clean = ~excluded
+    t     = np.arange(n, dtype=float) / fs
 
-    def _detect_one(signal, ch_name):
-        print(f"    [slinger/{ch_name}] running slinger detection")
+    def _detect_one(signal, ch_name, cfg):
+        # Odd window sizes in samples
+        def _win(seconds):
+            w = max(5, int(round(seconds * fs)))
+            return w if w % 2 == 1 else w + 1
 
-        # ── spectrogram with reflect-padding to suppress edge effects ─────────
-        sig_pad = np.pad(signal, pad_width=pad, mode="reflect")
-        f, ts_pad, Sxx = _spectrogram(
-            sig_pad, fs=fs, nperseg=nperseg, noverlap=noverlap,
-            nfft=nfft, scaling="density",
-        )
-        ts = ts_pad - pad / fs
+        baseline_win = _win(cfg["baseline_window_s"])
+        feature_win  = _win(cfg["feature_window_s"])
+        trend_win    = _win(cfg["trend_window_s"])
 
-        # Trim to bins fully inside the original signal
-        duration = (n - 1) / fs
-        valid    = (ts >= half_win_s) & (ts <= duration - half_win_s)
-        ts  = ts[valid]
-        Sxx = Sxx[:, valid]
+        baseline   = _rolling_median(signal, baseline_win)
+        slow_trend = _rolling_mean(signal,   trend_win)
+        residual   = signal - baseline
+        slope      = np.abs(np.gradient(signal, t))
 
-        # ── HF band energy: log-transformed and smoothed ──────────────────────
-        hf_band   = (f >= hf_low) & (f <= hf_high)
-        hf_energy    = np.sum(Sxx[hf_band, :], axis=0)
-        total_energy = np.sum(Sxx, axis=0)
-        hf_ratio     = hf_energy / (total_energy + 1e-12)
+        residual_rms = np.sqrt(np.maximum(
+            _rolling_mean(residual ** 2, feature_win), 0.0))
+        slope_mean   = _rolling_mean(slope, feature_win)
+        trend_dev    = np.abs(signal - slow_trend)
 
-        if smooth_window > 1:
-            kernel    = np.ones(smooth_window) / smooth_window
-            hf_smooth = np.convolve(hf_ratio, kernel, mode="same")
-        else:
-            hf_smooth = hf_ratio.copy()
+        # Robust z-scores: statistics derived from clean samples only
+        def _zsc(x):
+            ref = x[clean]
+            if ref.size == 0:
+                return np.zeros(n)
+            med = float(np.nanmedian(ref))
+            mad = float(np.nanmedian(np.abs(ref - med)))
+            if not np.isfinite(mad) or mad < 1e-12:
+                return np.zeros(n)
+            return np.clip(0.6745 * (x - med) / mad, 0.0, None)
 
-        # ── classify bins: clean (baseline) vs scan (detection) ──────────────
-        def _excl_frac(ts_i):
-            s = max(0, int((ts_i - half_win_s) * fs))
-            e = min(n, int((ts_i + half_win_s) * fs))
-            return float(excluded[s:e].mean()) if e > s else 1.0
+        z_residual  = _zsc(residual_rms)
+        z_slope     = _zsc(slope_mean)
+        z_deviation = _zsc(trend_dev)
+        score       = 1.0 * z_residual + 1.0 * z_slope + 0.4 * z_deviation
 
-        excl_frac  = np.array([_excl_frac(ti) for ti in ts])
-        clean_bins = excl_frac < 0.5   # for baseline estimation
-        scan_bins  = excl_frac < 0.1   # for candidate detection
+        z_thr = cfg["z_threshold"]
+        s_thr = cfg["score_threshold"]
 
-        # ── baseline and threshold ────────────────────────────────────────────
-        # Baseline: restrict to the lower half of the reference distribution.
-        # Slinger bins have elevated HF ratio and end up in the upper tail;
-        # including them inflates both median and MAD, pushing the threshold
-        # far above the actual signal range.  The lower half is always
-        # slinger-free as long as the artefact covers < 50 % of the recording.
-        ref_all = hf_smooth[clean_bins] if clean_bins.any() else hf_smooth
-        lo_cut  = float(np.median(ref_all))
-        ref     = ref_all[ref_all <= lo_cut]
-        if ref.size == 0:
-            ref = ref_all
-        median = float(np.median(ref))
-        mad    = float(np.median(np.abs(ref - median)))
-        thr    = median + k * 1.4826 * mad
-        # Floor: never let the threshold drop below 10 % of the signal peak.
-        # When the baseline is extremely stable (MAD ≈ 0) the formula above
-        # produces a threshold near the median, which triggers on noise.
-        thr    = max(thr, 0.20 * float(np.max(hf_smooth)))
+        # Floor: threshold must be at least 15 % of the score range on clean
+        # samples, so that a uniformly quiet signal cannot produce a threshold
+        # that sits at or below the score median and flag half the recording.
+        if clean.any():
+            clean_score = score[clean]
+            score_range = float(clean_score.max() - clean_score.min())
+            score_floor = 0.15 * score_range
+            if score_floor > s_thr:
+                s_thr = score_floor
 
-        print(f"    [slinger/{ch_name}] HF {hf_low:.0f}-{hf_high:.0f} Hz  "
-              f"baseline median={median:.3f}  MAD={mad:.4f}  thr={thr:.3f}  (k={k})")
+        raw_mask = (
+            ((z_residual > z_thr) & (z_slope > z_thr))
+            | (score > s_thr)
+        ) & clean
 
-        # ── candidate bins ────────────────────────────────────────────────────
-        candidate = hf_smooth > thr
+        # Suppress detections within one trend-window of each boundary.
+        # Rolling statistics have fewer neighbours there (even with min_periods)
+        # and np.gradient uses one-sided differences at the edges, both of which
+        # can produce spurious high scores.
+        margin = trend_win
+        raw_mask[:margin]  = False
+        raw_mask[-margin:] = False
 
-        # Fill small gaps between candidate bins
-        if fill_gap_bins > 1:
-            half_d = fill_gap_bins // 2
-            expanded = candidate.copy()
-            for shift in range(1, half_d + 1):
-                expanded[shift:]  |= candidate[:-shift]
-                expanded[:-shift] |= candidate[shift:]
-            candidate = expanded
+        periods = _mask_to_periods(
+            raw_mask, cfg["min_region_s"], cfg["merge_gap_s"], fs)
 
-        # Mask out excluded bins (fill before masking so gaps don't bleed in)
-        candidate = candidate & scan_bins
-
-        # ── find contiguous segments above threshold ───────────────────────────
-        periods = []
-        i = 0
-        m = len(ts)
-        while i < m:
-            if candidate[i]:
-                j = i + 1
-                while j < m and candidate[j]:
-                    j += 1
-                # Convert spectrogram bin centres to sample indices
-                s_samp = max(0, int(round(ts[i]     * fs)))
-                e_samp = min(n, int(round(ts[j - 1] * fs)) + 1)
-                dur_s  = (e_samp - s_samp) / fs
-                if dur_s >= min_event_s:
-                    periods.append((s_samp, e_samp))
-                    print(f"    [slinger/{ch_name}] period  "
-                          f"{s_samp/fs:.1f}-{e_samp/fs:.1f} s  "
-                          f"({dur_s:.1f} s  bins={j - i})")
-                i = j
-            else:
-                i += 1
-
-        print(f"    [slinger/{ch_name}] result: {len(periods)} period(s)")
-        diag = {"ts": ts, "hf_ratio": hf_ratio, "hf_smooth": hf_smooth, "threshold": thr}
+        diag = {"ts": t, "hf_ratio": z_residual, "hf_smooth": score,
+                "threshold": s_thr}
         return periods, diag
 
-    slinger_abp, diag_abp = _detect_one(abp, "abp")
-    slinger_cvp, diag_cvp = _detect_one(cvp, "cvp")
+    abp_cfg = dict(
+        baseline_window_s=abp_baseline_window_s,
+        feature_window_s=abp_feature_window_s,
+        trend_window_s=abp_trend_window_s,
+        z_threshold=abp_z_threshold,
+        score_threshold=abp_score_threshold,
+        min_region_s=abp_min_region_s,
+        merge_gap_s=abp_merge_gap_s,
+    )
+    cvp_cfg = dict(
+        baseline_window_s=cvp_baseline_window_s,
+        feature_window_s=cvp_feature_window_s,
+        trend_window_s=cvp_trend_window_s,
+        z_threshold=cvp_z_threshold,
+        score_threshold=cvp_score_threshold,
+        min_region_s=cvp_min_region_s,
+        merge_gap_s=cvp_merge_gap_s,
+    )
+
+    slinger_abp, diag_abp = _detect_one(abp, "abp", abp_cfg)
+    slinger_cvp, diag_cvp = _detect_one(cvp, "cvp", cvp_cfg)
     return slinger_abp, slinger_cvp, diag_abp, diag_cvp

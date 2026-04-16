@@ -48,6 +48,9 @@ LP_CUTOFF = 0.5   # low-pass cutoff used for baseline tracking (Hz)
 HP_CUTOFF = 1.0   # high-pass cutoff used for beat-amplitude/std tracking (Hz)
 SPEC_FMAX = 15.0  # upper frequency limit for spectrogram features (Hz)
 
+# Artefact keys that are shared across both channels (used in per-channel masks)
+_SHARED_KEYS = ("gasbubble_abp", "gasbubble_cvp", "transducer")
+
 # ── file picker ───────────────────────────────────────────────────────────────
 root = tk.Tk()
 root.withdraw()
@@ -69,17 +72,17 @@ print(f"Duration: {t[-1]:.1f} s  |  fs: {fs:.0f} Hz  |  {n} samples")
 
 # ── artefact registry ─────────────────────────────────────────────────────────
 artefacts = {
-    "cal_abp"    : [],
-    "flush_abp"  : [],
-    "infuus_abp" : [],
-    "cal_cvp"    : [],
-    "flush_cvp"  : [],
-    "infuus_cvp" : [],
-    "slinger_abp"   : [],
-    "slinger_cvp"   : [],
-    "gasbubble_abp" : [],
-    "gasbubble_cvp" : [],
-    "transducer"    : [],
+    "cal_abp"      : [],
+    "flush_abp"    : [],
+    "infuus_abp"   : [],
+    "cal_cvp"      : [],
+    "flush_cvp"    : [],
+    "infuus_cvp"   : [],
+    "slinger_abp"  : [],
+    "slinger_cvp"  : [],
+    "gasbubble_abp": [],
+    "gasbubble_cvp": [],
+    "transducer"   : [],
 }
 
 
@@ -98,6 +101,20 @@ def register(key, new_periods):
     artefacts[key].extend(new_periods)
 
 
+def _register_first(key, periods):
+    """Register only the earliest-starting non-overlapping new period."""
+    if not periods:
+        return False
+    excl_now = build_exclusion_mask()
+    non_overlapping = [p for p in periods if not excl_now[p[0]:p[1]].any()]
+    if not non_overlapping:
+        return False
+    first = min(non_overlapping, key=lambda p: p[0])
+    register(key, [first])
+    print(f"  {key:12s}: registered  {first[0]/fs:.1f}–{first[1]/fs:.1f} s")
+    return True
+
+
 # ── slinger diagnostic data (captured from the last slinger run) ──────────────
 slinger_diag_abp = slinger_diag_cvp = None
 
@@ -110,30 +127,17 @@ while True:
 
     excl_before = build_exclusion_mask().sum()
 
-    def _register_first(key, periods):
-        """Register only the earliest-starting non-overlapping period."""
-        if not periods:
-            return False
-        excl_now = build_exclusion_mask()
-        non_overlapping = [p for p in periods if not excl_now[p[0]:p[1]].any()]
-        if not non_overlapping:
-            return False
-        first = min(non_overlapping, key=lambda p: p[0])
-        register(key, [first])
-        print(f"  {key:12s}: registered  {first[0]/fs:.1f}–{first[1]/fs:.1f} s")
-        return True
+    # Exclusion masks for this iteration — computed once and shared across steps.
+    excl     = build_exclusion_mask()
+    excl_abp = build_exclusion_mask(("cal_abp", "flush_abp", "infuus_abp", "slinger_abp") + _SHARED_KEYS)
+    excl_cvp = build_exclusion_mask(("cal_cvp", "flush_cvp", "infuus_cvp", "slinger_cvp") + _SHARED_KEYS)
 
     # ── Step 1 : Calibration ──────────────────────────────────────────────────
-    excl = build_exclusion_mask()
-    _shared = ('gasbubble', 'transducer')
-    excl_abp = build_exclusion_mask(('cal_abp', 'flush_abp', 'infuus_abp', 'slinger_abp') + _shared)
-    excl_cvp = build_exclusion_mask(('cal_cvp', 'flush_cvp', 'infuus_cvp', 'slinger_cvp') + _shared)
-
     try:
         cal_abp, cal_cvp = detect_calibration(
             abp, cvp, fs, excluded=excl,
             lp_cutoff=LP_CUTOFF, hp_cutoff=HP_CUTOFF,
-            excluded_abp=excl_abp, excluded_cvp=excl_cvp
+            excluded_abp=excl_abp, excluded_cvp=excl_cvp,
         )
         for ch_candidates, ch_excl in [
             ([("cal_abp", p) for p in cal_abp], excl_abp),
@@ -155,7 +159,7 @@ while True:
         flush_abp, infuus_abp, flush_cvp, infuus_cvp = detect_flush_infuus(
             abp, cvp, fs, excluded=excl,
             lp_cutoff=LP_CUTOFF, hp_cutoff=HP_CUTOFF,
-            excluded_abp=excl_abp, excluded_cvp=excl_cvp
+            excluded_abp=excl_abp, excluded_cvp=excl_cvp,
         )
         for ch_candidates, ch_excl in [
             ([("flush_abp", p) for p in flush_abp] + [("infuus_abp", p) for p in infuus_abp], excl_abp),
@@ -176,7 +180,7 @@ while True:
     try:
         transducer_periods = detect_transducer_hoog(
             abp, cvp, fs, excluded=excl,
-            lp_cutoff=LP_CUTOFF, hp_cutoff=HP_CUTOFF
+            lp_cutoff=LP_CUTOFF, hp_cutoff=HP_CUTOFF,
         )
         if _register_first("transducer", transducer_periods):
             continue
