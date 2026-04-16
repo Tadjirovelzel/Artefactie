@@ -312,151 +312,111 @@ def detect_flush_infuus(abp, cvp, fs, excluded,
 
 def detect_transducer_hoog(abp, cvp, fs, excluded,
                             lp_cutoff, hp_cutoff,
-                            lp_drop_ratio=0.85,
-                            lp_exit_ratio=0.9,
+                            lp_drop_ratio=0.88,
                             hp_lo_ratio=0.3,
                             hp_hi_ratio=2.5,
-                            cardiac_fmin=0.5,
-                            cardiac_fmax=3.0,
-                            min_event_s=2.0,
-                            tail_guard_s=3.0):
+                            min_event_s=2.0):
     """
     Detect transducer-too-high artefacts.
 
-    Characteristic: the ABP LP baseline drops (transducer raised above the
-    phlebostatic axis → hydrostatic under-read) while cardiac oscillations
-    on the HP signal continue at roughly their normal amplitude.
+    Characteristic: ABP LP baseline drops to ≤ lp_drop_ratio × clean median
+    while cardiac oscillations (HP std) continue at roughly normal amplitude.
 
-    Detection
+    Algorithm
     ---------
-    The LP-filtered ABP is scanned for a sustained drop below
-    lp_drop_ratio × the clean LP median.  Entry and exit are confirmed
-    with the same window-mean approach as detect_calibration and
-    detect_flush_infuus: the mean of the LP over the next cardiac period
-    must also cross the threshold before the transition is registered.
-    Transient recoveries that are not window-confirmed are skipped.
+    1. Compute LP-filtered ABP; estimate clean LP median as baseline.
+    2. Mark samples below lp_drop_ratio × baseline (requires a genuine LP drop,
+       not just normal beat-to-beat variation).
+    3. Merge runs separated by less than one cardiac period.
+    4. Keep runs ≥ min_event_s; reject via HP-std guard.
 
-    HP std guard
-    ------------
-    After detection the mean rolling HP std inside each period must lie
-    within [hp_lo_ratio, hp_hi_ratio] × the clean HP std baseline:
-      • below hp_lo_ratio → oscillations absent; likely calibration residue
-      • above hp_hi_ratio → oscillations greatly elevated; likely slinger
-
-    Tail guard
+    Parameters
     ----------
-    A genuine transducer artefact must show a confirmed LP recovery before
-    the recording ends.  Any candidate whose exit falls within tail_guard_s
-    of the end of the signal is rejected (no confirmed recovery observed).
-
-    Hysteresis
-    ----------
-    Entry and exit use different thresholds to prevent the detector from
-    toggling off and on when the LP hovers near the boundary:
-      entry : LP drops below  lp_drop_ratio × baseline  (default 80 %)
-      exit  : LP rises above  lp_exit_ratio × baseline  (default 90 %)
-    The exit threshold must be higher than the entry threshold.  A genuine
-    recovery from a transducer-hoog event requires the LP to return well
-    toward the normal baseline, not merely cross the entry line.
+    lp_drop_ratio : LP must drop to this fraction of the clean median to
+                    trigger (default 0.80 — requires a 20 % drop).
+    hp_lo_ratio   : reject if mean HP std < hp_lo_ratio × baseline
+                    (oscillations absent → likely calibration)
+    hp_hi_ratio   : reject if mean HP std > hp_hi_ratio × baseline
+                    (oscillations greatly elevated → likely slinger)
+    min_event_s   : minimum accepted event duration (s)
 
     Returns
     -------
     list of (start, end) tuples
     """
-    print("    [transducer] running transducer-hoog detection")
-
-    n          = len(abp)
-    clean      = ~excluded
-    min_samp   = max(int(min_event_s * fs), 1)
-    tail_guard = max(int(tail_guard_s * fs), 0)
+    n        = len(abp)
+    clean    = ~excluded
+    min_samp = max(int(min_event_s * fs), 1)
 
     lp_abp = lowpass(abp,  fs, cutoff_hz=lp_cutoff)
     hp_abp = highpass(abp, fs, cutoff_hz=hp_cutoff)
     hp_std = rolling_std(hp_abp, fs, window_s=1.0)
 
-    lp_baseline = (float(np.median(lp_abp[clean])) if clean.any()
-                   else float(np.median(lp_abp)))
+    # Use the 90th percentile of clean LP as the baseline.
+    # Transducer hoog can only push LP *down*, so the upper tail of the
+    # distribution always represents the true normal level — even if the
+    # artefact covers the majority of the recording (up to ~90 %).
+    # The median would be pulled toward the artefact level in those cases.
+    lp_baseline = (float(np.percentile(lp_abp[clean], 90)) if clean.any()
+                   else float(np.percentile(lp_abp, 90)))
+    threshold   = lp_drop_ratio * lp_baseline
+
     valid_std   = clean & ~np.isnan(hp_std)
     hp_std_base = (float(np.median(hp_std[valid_std])) if valid_std.any()
                    else float(np.nanmedian(hp_std)))
-    entry_thr = lp_drop_ratio * lp_baseline
-    exit_thr  = lp_exit_ratio * lp_baseline
 
-    period_s = _estimate_cardiac_period(abp, clean, fs,
-                                         fmin=cardiac_fmin, fmax=cardiac_fmax)
-    window = max(int(period_s * fs), 1)
+    period_s = _estimate_cardiac_period(abp, clean, fs)
+    gap_samp = max(int(period_s * fs), 1)
 
     print(f"    [transducer] LP baseline={lp_baseline:.1f} mmHg  "
-          f"entry<{entry_thr:.1f} ({lp_drop_ratio:.0%})  "
-          f"exit>{exit_thr:.1f} ({lp_exit_ratio:.0%})")
+          f"threshold<{threshold:.1f} ({lp_drop_ratio:.0%})")
     print(f"    [transducer] HP-std baseline={hp_std_base:.2f} mmHg  "
-          f"accept range: [{hp_lo_ratio:.1f}x, {hp_hi_ratio:.1f}x]")
-    print(f"    [transducer] cardiac period={period_s:.2f} s  window={window} smp")
+          f"accept: [{hp_lo_ratio:.1f}×, {hp_hi_ratio:.1f}×]")
 
-    def _win_mean_lp(idx):
-        return float(np.mean(lp_abp[idx : min(idx + window, n)]))
+    # ── find runs below threshold ─────────────────────────────────────────────
+    below = (lp_abp < threshold) & clean
 
-    # ── scan LP for sustained drops ───────────────────────────────────────────
-    # Entry fires when LP drops below entry_thr; exit requires LP to recover
-    # above exit_thr (hysteresis).  A signal that hovers between the two
-    # thresholds is treated as still inside the period.
-    raw_periods = []
+    raw_runs = []
     i = 0
     while i < n:
-        if lp_abp[i] < entry_thr and not excluded[i]:
-            if _win_mean_lp(i) < entry_thr:
-                start = i
-                j = i + 1
-                while j < n:
-                    if lp_abp[j] >= exit_thr:
-                        if _win_mean_lp(j) >= exit_thr:
-                            # Confirmed exit — apply tail guard
-                            if j >= n - tail_guard:
-                                print(f"    [transducer] {start/fs:.1f}–{j/fs:.1f} s: "
-                                      f"exit within tail guard — rejected")
-                                i = j
-                                break
-                            if j - start >= min_samp:
-                                raw_periods.append((start, j))
-                            i = j
-                            break
-                        # Transient LP recovery above exit_thr — skip past it
-                        k = j + 1
-                        while k < n and lp_abp[k] >= exit_thr:
-                            k += 1
-                        j = k
-                    else:
-                        j += 1
-                else:
-                    # Reached end without confirmed recovery
-                    print(f"    [transducer] {start/fs:.1f}–end: "
-                          f"no confirmed LP recovery — rejected")
-                    i = n
-            else:
-                i += 1
+        if below[i]:
+            j = i + 1
+            while j < n and below[j]:
+                j += 1
+            raw_runs.append([i, j])
+            i = j
         else:
             i += 1
 
-    # ── HP std guard ──────────────────────────────────────────────────────────
+    # ── merge runs with short gaps (up to one cardiac period) ────────────────
+    merged = []
+    for run in raw_runs:
+        if merged and run[0] - merged[-1][1] <= gap_samp:
+            merged[-1][1] = run[1]
+        else:
+            merged.append(run)
+
+    # ── duration filter and HP std guard ─────────────────────────────────────
     periods = []
-    for start, end in raw_periods:
+    for start, end in merged:
+        if end - start < min_samp:
+            continue
+
         seg_std  = hp_std[start:end]
         seg_std  = seg_std[~np.isnan(seg_std)]
         mean_std = float(seg_std.mean()) if seg_std.size > 0 else 0.0
         ratio    = mean_std / hp_std_base if hp_std_base > 0 else 0.0
+        mean_lp  = float(lp_abp[start:end].mean())
 
         if ratio < hp_lo_ratio:
             print(f"    [transducer] {start/fs:.1f}–{end/fs:.1f} s: "
-                  f"oscillations absent (HP std {mean_std:.2f}, {ratio:.2f}× base) "
-                  f"— not transducer hoog")
+                  f"HP std {mean_std:.2f} ({ratio:.2f}× base) — oscillations absent, rejected")
             continue
         if ratio > hp_hi_ratio:
             print(f"    [transducer] {start/fs:.1f}–{end/fs:.1f} s: "
-                  f"oscillations greatly elevated (HP std {mean_std:.2f}, {ratio:.2f}× base) "
-                  f"— likely slinger")
+                  f"HP std {mean_std:.2f} ({ratio:.2f}× base) — oscillations elevated, rejected")
             continue
 
-        mean_lp = float(lp_abp[start:end].mean())
         periods.append((start, end))
         print(f"    [transducer] period  {start/fs:.1f}–{end/fs:.1f} s  "
               f"(LP {mean_lp:.1f} mmHg  HP std {mean_std:.2f} ({ratio:.2f}× base))")
@@ -477,107 +437,109 @@ def detect_gasbubble(abp, cvp, fs, mask,
                      cardiac_fmin=0.5,
                      cardiac_fmax=3.0):
     """
-    Detects gas bubble (damping) artefacts: a sustained drop in pulse pressure
-    (HP std) while the LP baseline remains stable.
+    Detects gas bubble (damping) artefacts per channel: a sustained drop in
+    pulse pressure (HP std) while the LP baseline remains stable.
 
-    Entry is confirmed when both conditions hold over a full cardiac period.
-    Exit is confirmed the same way — brief transients within a damped period
-    do not break it prematurely.
+    Detection runs independently on ABP and CVP so that damping visible on
+    only one channel is not incorrectly attributed to the other.
+
+    Returns
+    -------
+    gasbubble_abp, gasbubble_cvp : two lists of (start_idx, end_idx) tuples
     """
-    n = len(abp)
+    n     = len(abp)
     clean = ~mask
     if np.sum(clean) < int(10 * fs):
-        return []
+        return [], []
 
-    # ── filtered signals ──────────────────────────────────────────────────────
-    lp = lowpass(abp,  fs, cutoff_hz=lp_cutoff)
-    hp = highpass(abp, fs, cutoff_hz=hp_cutoff)
-
-    # ── baselines from clean samples ──────────────────────────────────────────
-    baseline_lp_mean = float(np.mean(lp[clean]))
-    hp_std_r         = rolling_std(hp, fs, window_s=1.0)
-    valid_std        = clean & ~np.isnan(hp_std_r)
-    baseline_hp_std  = float(np.median(hp_std_r[valid_std]) if valid_std.any()
-                             else np.nanmedian(hp_std_r))
-
-    if baseline_hp_std == 0:
-        return []
-
-    # ── per-sample damping mask ───────────────────────────────────────────────
-    # LP stability is NOT checked sample-by-sample: the patient's MAP can drift
-    # over a long damping event, creating repeated gaps that split one period
-    # into many.  LP is checked as a guard over the full detected period instead.
-    is_damped = hp_std_r < (baseline_hp_std * std_reduction_ratio)
-    candidate = is_damped & clean
-
-    print(f"    [gasbubble] LP baseline={baseline_lp_mean:.1f} mmHg  "
-          f"HP-std baseline={baseline_hp_std:.2f} mmHg  "
-          f"damping thr={baseline_hp_std * std_reduction_ratio:.2f} mmHg")
-
-    # ── confirmation window (one cardiac period) ──────────────────────────────
+    # Cardiac period estimated from ABP (more reliable), shared by both channels.
     period_s = _estimate_cardiac_period(abp, clean, fs,
                                          fmin=cardiac_fmin, fmax=cardiac_fmax)
     window   = max(int(period_s * fs), 1)
     min_samp = max(int(min_event_s * fs), 1)
 
-    def _win_frac(idx):
-        seg = candidate[idx : min(idx + window, n)]
-        return float(seg.mean()) if len(seg) > 0 else 0.0
+    def _detect_one(signal, ch_name):
+        lp       = lowpass(signal,  fs, cutoff_hz=lp_cutoff)
+        hp       = highpass(signal, fs, cutoff_hz=hp_cutoff)
 
-    # ── scan: entry and exit both confirmed over one cardiac period ───────────
-    raw_periods = []
-    i = 0
-    while i < n:
-        if candidate[i] and _win_frac(i) >= 0.5:
-            start = i
-            j = i + 1
-            while j < n:
-                if not candidate[j]:
-                    if _win_frac(j) < 0.5:
-                        if j - start >= min_samp:
-                            raw_periods.append((start, j))
-                        i = j
-                        break
-                    # Transient gap — skip past this non-candidate run
-                    k = j + 1
-                    while k < n and not candidate[k]:
-                        k += 1
-                    j = k
+        baseline_lp_mean = float(np.mean(lp[clean]))
+        hp_std_r         = rolling_std(hp, fs, window_s=1.0)
+        valid_std        = clean & ~np.isnan(hp_std_r)
+        baseline_hp_std  = float(np.median(hp_std_r[valid_std]) if valid_std.any()
+                                 else np.nanmedian(hp_std_r))
+
+        if baseline_hp_std == 0:
+            print(f"    [gasbubble/{ch_name}] HP-std baseline is zero — skipping")
+            return []
+
+        # LP stability is NOT checked sample-by-sample: MAP can drift over a
+        # long damping event, creating repeated gaps that split one period into
+        # many.  LP is checked as a guard over the full detected period instead.
+        is_damped = hp_std_r < (baseline_hp_std * std_reduction_ratio)
+        candidate = is_damped & clean
+
+        print(f"    [gasbubble/{ch_name}] LP baseline={baseline_lp_mean:.1f} mmHg  "
+              f"HP-std baseline={baseline_hp_std:.2f} mmHg  "
+              f"damping thr={baseline_hp_std * std_reduction_ratio:.2f} mmHg")
+
+        def _win_frac(idx):
+            seg = candidate[idx : min(idx + window, n)]
+            return float(seg.mean()) if len(seg) > 0 else 0.0
+
+        # ── scan: entry and exit both confirmed over one cardiac period ───────
+        raw_periods = []
+        i = 0
+        while i < n:
+            if candidate[i] and _win_frac(i) >= 0.5:
+                start = i
+                j = i + 1
+                while j < n:
+                    if not candidate[j]:
+                        if _win_frac(j) < 0.5:
+                            if j - start >= min_samp:
+                                raw_periods.append((start, j))
+                            i = j
+                            break
+                        # Transient gap — skip past this non-candidate run
+                        k = j + 1
+                        while k < n and not candidate[k]:
+                            k += 1
+                        j = k
+                    else:
+                        j += 1
                 else:
-                    j += 1
+                    if n - start >= min_samp:
+                        raw_periods.append((start, n))
+                    i = n
             else:
-                if n - start >= min_samp:
-                    raw_periods.append((start, n))
-                i = n
-        else:
-            i += 1
+                i += 1
 
-    # ── LP stability guard ────────────────────────────────────────────────────
-    # Reject periods where the mean LP over the whole period deviates too far
-    # from baseline — distinguishes gas bubble (stable MAP) from transducer
-    # hoog (LP drops) or flush (LP spikes).
-    periods = []
-    for start, end in raw_periods:
-        mean_lp = float(np.mean(lp[start:end]))
-        lp_dev  = abs(mean_lp - baseline_lp_mean) / baseline_lp_mean
-        if lp_dev > lp_stability_threshold:
-            print(f"    [gasbubble] {start/fs:.1f}–{end/fs:.1f} s rejected: "
-                  f"LP mean {mean_lp:.1f} mmHg deviates {lp_dev:.0%} from baseline")
-        else:
-            periods.append((start, end))
-            print(f"    [gasbubble] period  {start/fs:.1f}–{end/fs:.1f} s  "
-                  f"({(end-start)/fs:.1f} s)")
+        # ── LP stability guard ────────────────────────────────────────────────
+        periods = []
+        for start, end in raw_periods:
+            mean_lp = float(np.mean(lp[start:end]))
+            lp_dev  = abs(mean_lp - baseline_lp_mean) / baseline_lp_mean
+            if lp_dev > lp_stability_threshold:
+                print(f"    [gasbubble/{ch_name}] {start/fs:.1f}–{end/fs:.1f} s rejected: "
+                      f"LP mean {mean_lp:.1f} mmHg deviates {lp_dev:.0%} from baseline")
+            else:
+                periods.append((start, end))
+                print(f"    [gasbubble/{ch_name}] period  {start/fs:.1f}–{end/fs:.1f} s  "
+                      f"({(end-start)/fs:.1f} s)")
 
-    print(f"    [gasbubble] result: {len(periods)} period(s)")
-    return periods
+        print(f"    [gasbubble/{ch_name}] result: {len(periods)} period(s)")
+        return periods
+
+    gasbubble_abp = _detect_one(abp, "abp")
+    gasbubble_cvp = _detect_one(cvp, "cvp")
+    return gasbubble_abp, gasbubble_cvp
 
 # ── step 5 : slinger (last resort — only runs when no other artefacts remain) ──
 
 def detect_slinger(abp, cvp, fs, excluded,
                    hf_low=8.0,
                    hf_high=20.0,
-                   baseline_percentile=40,
-                   k=18.0,
+                   k=7,
                    smooth_window=5,
                    fill_gap_bins=2,
                    min_event_s=1.0):
@@ -591,21 +553,18 @@ def detect_slinger(abp, cvp, fs, excluded,
     1. Compute the spectrogram (1 s window, 0.5 s overlap, 2 s nfft) with
        reflect-padding to avoid edge artefacts.
     2. Sum power in the HF band; log-transform then smooth with a rolling mean.
-    3. Estimate the baseline from non-excluded bins at the bottom
-       baseline_percentile of the distribution (robust when slinger fills most
-       of the recording).
-    4. Threshold = baseline median + k × baseline std.
-    5. Fill small inter-bin gaps (fill_gap_bins), mask excluded bins, then keep
+    3. Estimate the baseline from non-excluded (clean) spectrogram bins:
+       threshold = mean(clean HF power) + k × std(clean HF power).
+    4. Fill small inter-bin gaps (fill_gap_bins), mask excluded bins, then keep
        runs that meet min_event_s.
 
     Parameters
     ----------
-    hf_low / hf_high    : HF band limits for ringing energy (Hz)
-    baseline_percentile : upper percentile cut for baseline estimation
-    k                   : threshold multiplier  (baseline_median + k × std)
-    smooth_window       : rolling-mean window in spectrogram bins
-    fill_gap_bins       : dilation width to bridge short inter-segment gaps
-    min_event_s         : minimum accepted event duration (s)
+    hf_low / hf_high : HF band limits for ringing energy (Hz)
+    k                : threshold multiplier  (clean_mean + k × clean_std)
+    smooth_window    : rolling-mean window in spectrogram bins
+    fill_gap_bins    : dilation width to bridge short inter-segment gaps
+    min_event_s      : minimum accepted event duration (s)
 
     Returns
     -------
@@ -637,14 +596,15 @@ def detect_slinger(abp, cvp, fs, excluded,
 
         # ── HF band energy: log-transformed and smoothed ──────────────────────
         hf_band   = (f >= hf_low) & (f <= hf_high)
-        hf_energy = np.sum(Sxx[hf_band, :], axis=0)
-        hf_log    = np.log1p(hf_energy)
+        hf_energy    = np.sum(Sxx[hf_band, :], axis=0)
+        total_energy = np.sum(Sxx, axis=0)
+        hf_ratio     = hf_energy / (total_energy + 1e-12)
 
         if smooth_window > 1:
             kernel    = np.ones(smooth_window) / smooth_window
-            hf_smooth = np.convolve(hf_log, kernel, mode="same")
+            hf_smooth = np.convolve(hf_ratio, kernel, mode="same")
         else:
-            hf_smooth = hf_log.copy()
+            hf_smooth = hf_ratio.copy()
 
         # ── classify bins: clean (baseline) vs scan (detection) ──────────────
         def _excl_frac(ts_i):
@@ -657,15 +617,26 @@ def detect_slinger(abp, cvp, fs, excluded,
         scan_bins  = excl_frac < 0.1   # for candidate detection
 
         # ── baseline and threshold ────────────────────────────────────────────
-        ref      = hf_smooth[clean_bins] if clean_bins.any() else hf_smooth
-        bl_limit = np.percentile(ref, baseline_percentile)
-        bl       = ref[ref <= bl_limit]
-        med      = float(np.median(bl))
-        std      = float(np.std(bl))
-        thr      = med + k * std
+        # Baseline: restrict to the lower half of the reference distribution.
+        # Slinger bins have elevated HF ratio and end up in the upper tail;
+        # including them inflates both median and MAD, pushing the threshold
+        # far above the actual signal range.  The lower half is always
+        # slinger-free as long as the artefact covers < 50 % of the recording.
+        ref_all = hf_smooth[clean_bins] if clean_bins.any() else hf_smooth
+        lo_cut  = float(np.median(ref_all))
+        ref     = ref_all[ref_all <= lo_cut]
+        if ref.size == 0:
+            ref = ref_all
+        median = float(np.median(ref))
+        mad    = float(np.median(np.abs(ref - median)))
+        thr    = median + k * 1.4826 * mad
+        # Floor: never let the threshold drop below 10 % of the signal peak.
+        # When the baseline is extremely stable (MAD ≈ 0) the formula above
+        # produces a threshold near the median, which triggers on noise.
+        thr    = max(thr, 0.20 * float(np.max(hf_smooth)))
 
         print(f"    [slinger/{ch_name}] HF {hf_low:.0f}-{hf_high:.0f} Hz  "
-              f"baseline med={med:.3f}  std={std:.4f}  thr={thr:.3f}  (k={k})")
+              f"baseline median={median:.3f}  MAD={mad:.4f}  thr={thr:.3f}  (k={k})")
 
         # ── candidate bins ────────────────────────────────────────────────────
         candidate = hf_smooth > thr
@@ -705,7 +676,7 @@ def detect_slinger(abp, cvp, fs, excluded,
                 i += 1
 
         print(f"    [slinger/{ch_name}] result: {len(periods)} period(s)")
-        diag = {"ts": ts, "hf_log": hf_log, "hf_smooth": hf_smooth, "threshold": thr}
+        diag = {"ts": ts, "hf_ratio": hf_ratio, "hf_smooth": hf_smooth, "threshold": thr}
         return periods, diag
 
     slinger_abp, diag_abp = _detect_one(abp, "abp")

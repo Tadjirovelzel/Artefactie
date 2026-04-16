@@ -17,10 +17,11 @@ ARTEFACT_COLOURS = {
     "cal_cvp"    : "#17becf",   # teal
     "flush_cvp"  : "#ffbb78",   # light orange
     "infuus_cvp" : "#c49c94",   # light brown
-    "slinger_abp": "#d62728",   # red
-    "slinger_cvp": "#e57373",   # light red
-    "gasbubble"  : "#2ca02c",   # green
-    "transducer" : "#9467bd",   # purple
+    "slinger_abp"   : "#d62728",   # red
+    "slinger_cvp"   : "#e57373",   # light red
+    "gasbubble_abp" : "#2ca02c",   # green
+    "gasbubble_cvp" : "#98df8a",   # light green
+    "transducer"    : "#9467bd",   # purple
 }
 
 # Which subplot column(s) each artefact key is drawn on
@@ -31,10 +32,11 @@ ARTEFACT_AXES = {
     "cal_cvp"    : ("cvp",),
     "flush_cvp"  : ("cvp",),
     "infuus_cvp" : ("cvp",),
-    "slinger_abp": ("abp",),
-    "slinger_cvp": ("cvp",),
-    "gasbubble"  : ("abp", "cvp"),
-    "transducer" : ("abp", "cvp"),
+    "slinger_abp"   : ("abp",),
+    "slinger_cvp"   : ("cvp",),
+    "gasbubble_abp" : ("abp",),
+    "gasbubble_cvp" : ("cvp",),
+    "transducer"    : ("abp", "cvp"),
 }
 
 
@@ -144,15 +146,15 @@ def plot_results(t, abp, cvp, fs, artefacts,
         ax = axes[3, col]
         colour = ARTEFACT_COLOURS[slinger_key]
         if diag is not None:
-            ax.plot(diag["ts"], diag["hf_log"],    color="0.75", lw=0.8,
-                    label="HF energy (log)")
+            ax.plot(diag["ts"], diag["hf_ratio"],  color="0.75", lw=0.8,
+                    label="HF / total power")
             ax.plot(diag["ts"], diag["hf_smooth"], color="C0",   lw=1.2,
                     label="Smoothed")
             ax.axhline(diag["threshold"], color="C3", lw=1.0, ls="--",
                        label="Threshold")
             for s, e in artefacts[slinger_key]:
                 ax.axvspan(t[s], t[min(e, n - 1)], color=colour, alpha=0.35, lw=0)
-            ax.set_ylabel("log(1 + HF power)")
+            ax.set_ylabel("HF / total power")
             ax.set_xlim(diag["ts"][0], diag["ts"][-1])
             ax.legend(loc="upper right", fontsize=7, ncol=3)
         else:

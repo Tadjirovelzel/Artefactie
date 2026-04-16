@@ -75,10 +75,11 @@ artefacts = {
     "cal_cvp"    : [],
     "flush_cvp"  : [],
     "infuus_cvp" : [],
-    "slinger_abp": [],
-    "slinger_cvp": [],
-    "gasbubble"  : [],
-    "transducer" : [],
+    "slinger_abp"   : [],
+    "slinger_cvp"   : [],
+    "gasbubble_abp" : [],
+    "gasbubble_cvp" : [],
+    "transducer"    : [],
 }
 
 
@@ -184,13 +185,19 @@ while True:
 
     # ── Step 4 : Gasbubbel (Damping) ──────────────────────────────────────────
     try:
-        gasbubble_periods = detect_gasbubble(
+        gasbubble_abp_periods, gasbubble_cvp_periods = detect_gasbubble(
             abp, cvp, fs,
             mask=excl,
             lp_cutoff=LP_CUTOFF,
             hp_cutoff=HP_CUTOFF,
         )
-        if _register_first("gasbubble", gasbubble_periods):
+        registered = False
+        for key, periods in [("gasbubble_abp", gasbubble_abp_periods),
+                              ("gasbubble_cvp", gasbubble_cvp_periods)]:
+            if _register_first(key, periods):
+                registered = True
+                break
+        if registered:
             continue
     except Exception as e:
         print(f"  gasbubble error: {e}")
