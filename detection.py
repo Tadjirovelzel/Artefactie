@@ -465,14 +465,120 @@ def detect_transducer_hoog(abp, cvp, fs, excluded,
     return periods
 
 
-# ── step 4 : slinger ───────────────────────────────────────────────────────────
+
+# ── step 4 : gas bubble ───────────────────────────────────────────────────────
+
+def detect_gasbubble(abp, cvp, fs, mask,
+                     lp_cutoff=0.5,
+                     hp_cutoff=1.0,
+                     std_reduction_ratio=0.5,
+                     lp_stability_threshold=0.15,
+                     min_event_s=3.0,
+                     cardiac_fmin=0.5,
+                     cardiac_fmax=3.0):
+    """
+    Detects gas bubble (damping) artefacts: a sustained drop in pulse pressure
+    (HP std) while the LP baseline remains stable.
+
+    Entry is confirmed when both conditions hold over a full cardiac period.
+    Exit is confirmed the same way — brief transients within a damped period
+    do not break it prematurely.
+    """
+    n = len(abp)
+    clean = ~mask
+    if np.sum(clean) < int(10 * fs):
+        return []
+
+    # ── filtered signals ──────────────────────────────────────────────────────
+    lp = lowpass(abp,  fs, cutoff_hz=lp_cutoff)
+    hp = highpass(abp, fs, cutoff_hz=hp_cutoff)
+
+    # ── baselines from clean samples ──────────────────────────────────────────
+    baseline_lp_mean = float(np.mean(lp[clean]))
+    hp_std_r         = rolling_std(hp, fs, window_s=1.0)
+    valid_std        = clean & ~np.isnan(hp_std_r)
+    baseline_hp_std  = float(np.median(hp_std_r[valid_std]) if valid_std.any()
+                             else np.nanmedian(hp_std_r))
+
+    if baseline_hp_std == 0:
+        return []
+
+    # ── per-sample damping mask ───────────────────────────────────────────────
+    # LP stability is NOT checked sample-by-sample: the patient's MAP can drift
+    # over a long damping event, creating repeated gaps that split one period
+    # into many.  LP is checked as a guard over the full detected period instead.
+    is_damped = hp_std_r < (baseline_hp_std * std_reduction_ratio)
+    candidate = is_damped & clean
+
+    print(f"    [gasbubble] LP baseline={baseline_lp_mean:.1f} mmHg  "
+          f"HP-std baseline={baseline_hp_std:.2f} mmHg  "
+          f"damping thr={baseline_hp_std * std_reduction_ratio:.2f} mmHg")
+
+    # ── confirmation window (one cardiac period) ──────────────────────────────
+    period_s = _estimate_cardiac_period(abp, clean, fs,
+                                         fmin=cardiac_fmin, fmax=cardiac_fmax)
+    window   = max(int(period_s * fs), 1)
+    min_samp = max(int(min_event_s * fs), 1)
+
+    def _win_frac(idx):
+        seg = candidate[idx : min(idx + window, n)]
+        return float(seg.mean()) if len(seg) > 0 else 0.0
+
+    # ── scan: entry and exit both confirmed over one cardiac period ───────────
+    raw_periods = []
+    i = 0
+    while i < n:
+        if candidate[i] and _win_frac(i) >= 0.5:
+            start = i
+            j = i + 1
+            while j < n:
+                if not candidate[j]:
+                    if _win_frac(j) < 0.5:
+                        if j - start >= min_samp:
+                            raw_periods.append((start, j))
+                        i = j
+                        break
+                    # Transient gap — skip past this non-candidate run
+                    k = j + 1
+                    while k < n and not candidate[k]:
+                        k += 1
+                    j = k
+                else:
+                    j += 1
+            else:
+                if n - start >= min_samp:
+                    raw_periods.append((start, n))
+                i = n
+        else:
+            i += 1
+
+    # ── LP stability guard ────────────────────────────────────────────────────
+    # Reject periods where the mean LP over the whole period deviates too far
+    # from baseline — distinguishes gas bubble (stable MAP) from transducer
+    # hoog (LP drops) or flush (LP spikes).
+    periods = []
+    for start, end in raw_periods:
+        mean_lp = float(np.mean(lp[start:end]))
+        lp_dev  = abs(mean_lp - baseline_lp_mean) / baseline_lp_mean
+        if lp_dev > lp_stability_threshold:
+            print(f"    [gasbubble] {start/fs:.1f}–{end/fs:.1f} s rejected: "
+                  f"LP mean {mean_lp:.1f} mmHg deviates {lp_dev:.0%} from baseline")
+        else:
+            periods.append((start, end))
+            print(f"    [gasbubble] period  {start/fs:.1f}–{end/fs:.1f} s  "
+                  f"({(end-start)/fs:.1f} s)")
+
+    print(f"    [gasbubble] result: {len(periods)} period(s)")
+    return periods
+
+# ── step 5 : slinger (last resort — only runs when no other artefacts remain) ──
 
 def detect_slinger(abp, cvp, fs, excluded,
                    hf_low=8.0,
                    hf_high=20.0,
                    baseline_percentile=40,
-                   k=4.0,
-                   smooth_window=3,
+                   k=18.0,
+                   smooth_window=5,
                    fill_gap_bins=2,
                    min_event_s=1.0):
     """
@@ -605,110 +711,3 @@ def detect_slinger(abp, cvp, fs, excluded,
     slinger_abp, diag_abp = _detect_one(abp, "abp")
     slinger_cvp, diag_cvp = _detect_one(cvp, "cvp")
     return slinger_abp, slinger_cvp, diag_abp, diag_cvp
-
-
-# ── step 5 : gas bubble ────────────────────────────────────────────────────────
-
-def detect_gasbubble(abp, cvp, fs, mask,
-                     lp_cutoff=0.5,
-                     hp_cutoff=1.0,
-                     std_reduction_ratio=0.5,
-                     lp_stability_threshold=0.15,
-                     min_event_s=3.0,
-                     cardiac_fmin=0.5,
-                     cardiac_fmax=3.0):
-    """
-    Detects gas bubble (damping) artefacts: a sustained drop in pulse pressure
-    (HP std) while the LP baseline remains stable.
-
-    Entry is confirmed when both conditions hold over a full cardiac period.
-    Exit is confirmed the same way — brief transients within a damped period
-    do not break it prematurely.
-    """
-    n = len(abp)
-    clean = ~mask
-    if np.sum(clean) < int(10 * fs):
-        return []
-
-    # ── filtered signals ──────────────────────────────────────────────────────
-    lp = lowpass(abp,  fs, cutoff_hz=lp_cutoff)
-    hp = highpass(abp, fs, cutoff_hz=hp_cutoff)
-
-    # ── baselines from clean samples ──────────────────────────────────────────
-    baseline_lp_mean = float(np.mean(lp[clean]))
-    hp_std_r         = rolling_std(hp, fs, window_s=1.0)
-    valid_std        = clean & ~np.isnan(hp_std_r)
-    baseline_hp_std  = float(np.median(hp_std_r[valid_std]) if valid_std.any()
-                             else np.nanmedian(hp_std_r))
-
-    if baseline_hp_std == 0:
-        return []
-
-    # ── per-sample damping mask ───────────────────────────────────────────────
-    # LP stability is NOT checked sample-by-sample: the patient's MAP can drift
-    # over a long damping event, creating repeated gaps that split one period
-    # into many.  LP is checked as a guard over the full detected period instead.
-    is_damped = hp_std_r < (baseline_hp_std * std_reduction_ratio)
-    candidate = is_damped & clean
-
-    print(f"    [gasbubble] LP baseline={baseline_lp_mean:.1f} mmHg  "
-          f"HP-std baseline={baseline_hp_std:.2f} mmHg  "
-          f"damping thr={baseline_hp_std * std_reduction_ratio:.2f} mmHg")
-
-    # ── confirmation window (one cardiac period) ──────────────────────────────
-    period_s = _estimate_cardiac_period(abp, clean, fs,
-                                         fmin=cardiac_fmin, fmax=cardiac_fmax)
-    window   = max(int(period_s * fs), 1)
-    min_samp = max(int(min_event_s * fs), 1)
-
-    def _win_frac(idx):
-        seg = candidate[idx : min(idx + window, n)]
-        return float(seg.mean()) if len(seg) > 0 else 0.0
-
-    # ── scan: entry and exit both confirmed over one cardiac period ───────────
-    raw_periods = []
-    i = 0
-    while i < n:
-        if candidate[i] and _win_frac(i) >= 0.5:
-            start = i
-            j = i + 1
-            while j < n:
-                if not candidate[j]:
-                    if _win_frac(j) < 0.5:
-                        if j - start >= min_samp:
-                            raw_periods.append((start, j))
-                        i = j
-                        break
-                    # Transient gap — skip past this non-candidate run
-                    k = j + 1
-                    while k < n and not candidate[k]:
-                        k += 1
-                    j = k
-                else:
-                    j += 1
-            else:
-                if n - start >= min_samp:
-                    raw_periods.append((start, n))
-                i = n
-        else:
-            i += 1
-
-    # ── LP stability guard ────────────────────────────────────────────────────
-    # Reject periods where the mean LP over the whole period deviates too far
-    # from baseline — distinguishes gas bubble (stable MAP) from transducer
-    # hoog (LP drops) or flush (LP spikes).
-    periods = []
-    for start, end in raw_periods:
-        mean_lp = float(np.mean(lp[start:end]))
-        lp_dev  = abs(mean_lp - baseline_lp_mean) / baseline_lp_mean
-        if lp_dev > lp_stability_threshold:
-            print(f"    [gasbubble] {start/fs:.1f}–{end/fs:.1f} s rejected: "
-                  f"LP mean {mean_lp:.1f} mmHg deviates {lp_dev:.0%} from baseline")
-        else:
-            periods.append((start, end))
-            print(f"    [gasbubble] period  {start/fs:.1f}–{end/fs:.1f} s  "
-                  f"({(end-start)/fs:.1f} s)")
-
-    print(f"    [gasbubble] result: {len(periods)} period(s)")
-    return periods
-
