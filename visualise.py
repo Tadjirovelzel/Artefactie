@@ -82,13 +82,13 @@ def plot_results(t, ABP, CVP, fs, artefacts,
     # ── figure layout ─────────────────────────────────────────────────────────
     fig, axes = plt.subplots(4, 2, figsize=(14, 14), sharex="row")
     fig.suptitle(os.path.basename(path) if isinstance(path, str) else "recording",
-                 fontsize=11)
+                fontsize=11)
 
     row_titles = ["Filtered signal", "Spectrogram", "Detected artefacts",
-                  "Slinger HF energy"]
+                "Slinger HF energy"]
     for row, title in enumerate(row_titles):
-        axes[row, 0].set_title(f"ABP — {title}", fontsize=10)
-        axes[row, 1].set_title(f"CVP — {title}", fontsize=10)
+        axes[row, 0].set_title(f"ABP — {title}", fontsize=10, pad=10)
+        axes[row, 1].set_title(f"CVP — {title}", fontsize=10, pad=10)
 
     # ── row 0 : filtered signals ──────────────────────────────────────────────
     for col, (raw, lp, hp) in enumerate([
@@ -121,12 +121,10 @@ def plot_results(t, ABP, CVP, fs, artefacts,
 
     ax_ABP2.plot(t, ABP, color="0.3", lw=0.8)
     ax_ABP2.set_ylabel("mmHg")
-    ax_ABP2.set_xlabel("Time (s)")
     ax_ABP2.set_xlim(t[0], t[-1])
 
     ax_CVP2.plot(t, CVP, color="0.3", lw=0.8)
     ax_CVP2.set_ylabel("mmHg")
-    ax_CVP2.set_xlabel("Time (s)")
     ax_CVP2.set_xlim(t[0], t[-1])
 
     artefact_axes_map = {"abp": ax_ABP2, "cvp": ax_CVP2}
@@ -157,16 +155,19 @@ def plot_results(t, ABP, CVP, fs, artefacts,
             ax.plot(diag["ts"], diag["hf_smooth"], color="C0",   lw=1.2,
                     label="Detection score")
             ax.axhline(diag["threshold"], color="C3", lw=1.0, ls="--",
-                       label="Threshold")
+                    label="Threshold")
             for s, e in artefacts[slinger_key]:
                 ax.axvspan(t[s], t[min(e, n - 1)], color=colour, alpha=0.35, lw=0)
             ax.set_ylabel("Detection score")
+            ax.set_xlabel("Time (s)")
             ax.set_xlim(diag["ts"][0], diag["ts"][-1])
             ax.legend(loc="upper right", fontsize=7, ncol=3)
         else:
             ax.text(0.5, 0.5, "no slinger run", transform=ax.transAxes,
                     ha="center", va="center", color="0.5")
+            ax.set_xlabel("Time (s)")
 
-    plt.tight_layout()
+    fig.tight_layout()
+    fig.subplots_adjust(hspace=0.38)
     plt.savefig("Plots.png", dpi=150, bbox_inches="tight")
     plt.show()

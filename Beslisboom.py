@@ -16,9 +16,9 @@ from beslisboom_helpers import (
 )
 
 # ── input ─────────────────────────────────────────────────────────────────────
-path = r"h:\school\Artefactie\data\KT3401_AFdata_2025"
-folder = "Calibratie"
-filename = "D01Cal.xlsx"
+path = []
+folder = []
+filename = []
 fs = 100
 t, ABP, CVP = read_Artefacts(path, folder, filename, fs)
 
